@@ -1,3 +1,5 @@
+task.wait(15)
+
 -- =========================
 --  Starts automatically on load. Home toggles it on/off.
 --
