@@ -164,7 +164,7 @@ local Config = {
     -- starts farming again automatically. Set QueueReexecute to false to only
     -- rejoin without re-running the script.
     QueueReexecute        = true,
-    ReexecuteUrl          = "https://pastebin.com/raw/Bh5E5Rq6",
+    ReexecuteUrl          = "https://raw.githubusercontent.com/goldoomen310-cpu/no/refs/heads/main/id",
     -- Movement tuning: unanchor when this fraction of the leg is complete so
     -- the final approach can fire touch interest early, and how long the
     -- stationary pickup finisher waits if the early touch did not register.
