@@ -1,68 +1,100 @@
 -- =========================
---  Starts automatically on load. Home toggles it on/off.
+--  AutoCandyFarm (register-safe rewrite)
 --
---  Flow:
---    1. Wait for RoundStart (or detect the round already in progress).
---    2. Hide under the map while idle (no candy / waiting for role).
---    3. As soon as candy exists, walk to the nearest safe candy. Exact-distance
---       ties use a stable per-object key so the picker cannot flip back and
---       forth. Movement uses Roblox's TweenService at the configured speed.
---       Non-murderers ignore candy within 10 studs horizontally and 10 studs
---       above or below the murderer.
---    4. The candy bag GUI counter is the authority: combat starts only when
---       the visible "Coins" counter under ...CoinBags.Container.Candy says 50.
---         Innocent -> fling sheriff -> grab dropped gun -> sync-shoot murderer
---         Sheriff  -> sync 3 studs behind murderer, hold for 1s, fire at 0.5s
---         Murderer -> set everyone's hitbox to 500 -> equip knife -> use knife's
---                     HandleTouched remote on everyone
+--  Fixes in this version:
+--    * Void self-heal: hiding is refused when no real floor is found, the
+--      hide point is validated, a watchdog rescues the character from the
+--      void, and repeated hide deaths disable hiding for the rest of the round.
+--    * "attempt to index nil with 'CharacterAdded'": LocalPlayer is awaited
+--      (up to 2 minutes) and every signal is attached through a fresh,
+--      pcall-protected lookup, so a queued rejoin loader can never hard-error.
+--    * Death while shooting: a revenge fling now waits for the shot to end,
+--      blocks the combat loop, and keeps flinging the murderer after respawn.
+--    * Stacked execution: every root mover (tween, hide hold, fling, teleport
+--      shoot, teleport gun) is mutually exclusive and every loop is bound to
+--      the instance token + worker id, so two copies cannot fight the root.
+--    * Duplicate execution: the live copy holds a heartbeat lease in getgenv.
+--      A second execution now prints a notice and exits without touching the
+--      first (set getgenv().__mm2candy_force = true first to replace it).
+--    * Register pressure: state lives in tables and self-contained systems are
+--      scoped in do-blocks, keeping the main chunk well under the 200-local
+--      "out of local registers" limit.
 --
---  Movement anchors the root only for the first 80% of each TweenService leg
---  (this locks the vertical axis and prevents jitter), then unanchors so touch
---  pickups can register during the final approach. A missed gun volley hides
---  under the map and idles for 4 seconds before the next attempt.
---
---  If you get kicked, the script rejoins the same server, queues the loader
---  URL, and re-executes on the new server. If that same round is still live
---  and the murderer is alive, it flings him after rejoining. If no round
---  starts for 90 seconds, it hops to a half-full server with the lowest ping.
---  If you die while farming with an unfinished bag, it flings the murderer
---  after you respawn so the round ends.
+--  Home toggles the farm. Config, Candy and P.api are exposed as before.
 -- =========================
 
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local Workspace        = game:GetService("Workspace")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService     = game:GetService("TweenService")
-local TeleportService  = game:GetService("TeleportService")
-local HttpService      = game:GetService("HttpService")
-local GuiService       = game:GetService("GuiService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local S = {
+    UserInputService = game:GetService("UserInputService"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    TeleportService = game:GetService("TeleportService"),
+    HttpService = game:GetService("HttpService"),
+    GuiService = game:GetService("GuiService"),
+}
 
-local LocalPlayer = Players.LocalPlayer
--- After a rejoin the queued loader can run before Players.LocalPlayer exists.
--- Indexing LocalPlayer.CharacterAdded while it is nil is what produced the
--- "attempt to index nil with 'CharacterAdded'" error on rejoin/respawn.
+-- The queued loader can run before Players.LocalPlayer exists. Indexing
+-- LocalPlayer.CharacterAdded while it is nil is what threw
+-- "attempt to index nil with 'CharacterAdded'" on rejoin/respawn.
+local LocalPlayer
 do
-    local waited = 0
-    while not LocalPlayer and waited < 20 do
+    local deadline = tick() + 120
+    while not Players.LocalPlayer and tick() < deadline do
         task.wait(0.1)
-        waited = waited + 0.1
-        LocalPlayer = Players.LocalPlayer
     end
+    LocalPlayer = Players.LocalPlayer
 end
 if not LocalPlayer then
     warn("[AutoCandyFarm] LocalPlayer unavailable; aborting")
     return
 end
 
--- Every CharacterAdded connection goes through this helper so a nil
--- LocalPlayer (or a missing signal during a rejoin) can never hard-error the
--- whole script. The callback itself is pcall-protected too.
+-- ==================== SINGLE-INSTANCE GUARD ====================
+-- The rejoin loader can be queued more than once, and executing the script
+-- twice used to tear down the first copy and start a second one. The first
+-- loaded copy now owns a heartbeat lease; any later copy exits before it
+-- touches P, the character, or the farm.
+local genv = getgenv()
+local LEASE_KEY = "__mm2candy_lease"
+local leaseToken
+do
+    local now = tick()
+    local force = genv.__mm2candy_force == true
+    genv.__mm2candy_force = nil
+
+    local lease = genv[LEASE_KEY]
+    local fresh = type(lease) == "table"
+        and lease.alive == true
+        and type(lease.id) == "string"
+        and type(lease.heartbeat) == "number"
+        and now - lease.heartbeat < 15
+        and lease.jobId == game.JobId
+
+    if fresh and not force then
+        print("[AutoCandyFarm] already running; duplicate execution ignored"
+            .. " (set getgenv().__mm2candy_force = true to replace it)")
+        return
+    end
+
+    leaseToken = tostring(now) .. ":" .. tostring(math.random(100000, 999999))
+        .. ":" .. tostring(game.JobId or "")
+    genv[LEASE_KEY] = {
+        alive = true,
+        heartbeat = now,
+        id = leaseToken,
+        jobId = game.JobId,
+    }
+end
+
+-- Always read Players.LocalPlayer at call time; a captured nil value is
+-- exactly what made rejoins explode.
 local function onCharacterAdded(fn)
-    if not LocalPlayer then return nil end
+    local lp = Players.LocalPlayer
+    if not lp then return nil end
     local ok, conn = pcall(function()
-        return LocalPlayer.CharacterAdded:Connect(function(char)
+        return lp.CharacterAdded:Connect(function(char)
             local good, err = pcall(fn, char)
             if not good then warn("[character] " .. tostring(err)) end
         end)
@@ -72,37 +104,6 @@ local function onCharacterAdded(fn)
     return nil
 end
 
-local Remotes     = ReplicatedStorage:WaitForChild("Remotes")
-local Gameplay    = Remotes:WaitForChild("Gameplay")
-
--- ==================== CONSTANTS ====================
-local CANDY_ATTR     = "CoinID"
-local CANDY_VALUE    = "Candy"
-local CANDY_PART     = "Coin_Server"
-local CANDY_CAP           = 50
-local START_DELAY         = 0
-local TWEEN_SPEED         = 30
-local GUN_SPEED           = 55
-local GUN_DISTANCE        = 1000
-local HITBOX_SIZE         = 500
-local KNIFE_EVENT         = "HandleTouched"
-
--- Candy danger filter ---------------------------------------------
--- Candies inside this box around the murderer are ignored: within 10 studs
--- horizontally and within 10 studs above or below. Movement does not avoid
--- the murderer at all; it only skips candy in this zone.
-local KILLER_IGNORE_RADIUS = 10   -- horizontal studs
-local KILLER_IGNORE_HEIGHT = 10   -- above and below the murderer
--- The animation the user wants locked while farming is a UGC emote. A UGC emote
--- id is not an animation asset id: loading the emote id directly yields a
--- zero-length track and nothing plays. The emote bundles the real animation
--- underneath, so it is resolved at runtime via game:GetObjects and the known
--- resolved id below is used as the fallback.
-local FARM_EMOTE_ID        = "71336154532229"
-local FARM_ANIMATION_ID    = "rbxassetid://130449961562896"
-
--- ==================== STATE ====================
-local genv = getgenv()
 genv.__mm2candy = genv.__mm2candy or {}
 local P = genv.__mm2candy
 if type(P) ~= "table" then
@@ -110,138 +111,118 @@ if type(P) ~= "table" then
     genv.__mm2candy = P
 end
 
+local Config = {
+    DebugLog             = false,
+    AutoStart            = true,
+    -- Candy
+    CandyCap             = 50,
+    CandyCacheTTL        = 0.5,
+    CandyMaxDistance     = 20000,
+    TweenSpeed           = 30,
+    KillerIgnoreRadius   = 10,
+    KillerIgnoreHeight   = 10,
+    -- Combat
+    AutoCombat           = true,
+    TeleportShootCooldown = 1.5,
+    GunDistance          = 1000,
+    HitboxSize           = 500,
+    KnifeEvent           = "HandleTouched",
+    SyncBehindDistance   = 3,
+    SyncBehindHeight     = 1,
+    SyncHoldTime         = 1.0,
+    SyncFireAt           = 0.5,
+    SyncVolleyShots      = 4,
+    SyncShotInterval     = 0.08,
+    MissRetryDelay       = 4,
+    -- Hiding
+    HideUnderMap         = true,
+    HideDepth            = 120,
+    HideMinFloorClearance = 20,
+    HideMinDepth         = 15,
+    HideMaxDepth         = 250,
+    -- Movement
+    Noclip               = true,
+    MoveUnanchorAt       = 0.8,
+    EarlyTouchDistance   = 5,
+    PickupFinishTime     = 0.12,
+    -- Rejoin / hop
+    AutoRejoin           = true,
+    AutoRejoinNoRoundTimeout = 90,
+    ServerHopMinFill     = 0.5,
+    ServerHopPages       = 2,
+    ServerHopRetryDelay  = 5,
+    ServerHopAllowFallback = true,
+    QueueReexecute       = true,
+    ReexecuteUrl         = "https://raw.githubusercontent.com/goldoomen310-cpu/no/refs/heads/main/id",
+}
+
+local Candy = P.candy
+if type(Candy) ~= "table" then Candy = {} end
+Candy.Enabled       = false
+Candy.Running       = false
+Candy.ActiveWorker  = nil
+Candy.TweenSpeed    = Config.TweenSpeed
+Candy.MaxDistance   = Config.CandyMaxDistance
+Candy.Cap           = Config.CandyCap
+Candy.Picked        = 0
+Candy.ServerCount   = 0
+Candy.Collected     = 0
+Candy.GuiReadyAt    = 0
+Candy.Target        = nil
+Candy.Busy          = false
+Candy.Hidden        = false
+Candy.Cache         = Candy.Cache or {}
+Candy.LastScan      = 0
+Candy.SkipUntil     = Candy.SkipUntil or {}
+Candy.Failures      = Candy.Failures or {}
+Candy.Plan          = nil
+P.candy = Candy
+
+-- Claim the new instance before tearing the old one down so any coroutine
+-- left behind stops at its next check instead of moving the same root.
+P.instance = (tonumber(P.instance) or 0) + 1
+local instanceToken = P.instance
+local function instanceAlive()
+    return P.instance == instanceToken
+end
 if type(P.teardown) == "function" then
     pcall(P.teardown)
 end
 
--- Each execution of this script gets a new instance token. Old coroutines from
--- a previous copy (or an in-flight teleport that survived a teardown) check
--- this token and stop instead of moving the new character at the same time.
-P.instance = (tonumber(P.instance) or 0) + 1
-local instanceToken = P.instance
+-- Forward tables. Systems below attach their methods once, and every caller
+-- reads them at runtime, so ordering never matters.
+local Fling   = { enabled = false }
+local Revenge = { active = false }
+local Scan    = { clearMemory = function() end }
+local WaitTurn = {
+    active = false, handled = false, lastCheck = 0,
+    lastAttempt = 0, clearedAt = 0, imageId = "189761558",
+}
+function WaitTurn.poll() return false end
+function WaitTurn.handle() end
 
-local function instanceAlive()
-    return P.instance == instanceToken
-end
-
-local Candy = P.candy or {}
-Candy.Enabled         = false
-Candy.Running         = false
-Candy.ActiveWorker    = nil
-Candy.TweenSpeed      = TWEEN_SPEED
-Candy.StartDelay      = START_DELAY
-Candy.MaxCandies      = CANDY_CAP
-Candy.Cap             = CANDY_CAP
-Candy.MaxDistance     = 20000
-Candy.CollectAsKiller = true
-Candy.CacheTTL        = 0.5
-Candy.ReturnToStart   = false
-Candy.Picked          = 0
-Candy.ServerCount     = 0
-Candy.Collected       = 0
-Candy.GuiCount        = 0
-Candy.GuiReadyAt      = 0
-Candy.Target          = nil
-Candy.Busy            = false
-Candy.Hidden          = false
-Candy.Cache           = Candy.Cache or {}
-Candy.LastScan        = 0
-Candy.SkipUntil       = Candy.SkipUntil or {}
-Candy.Failures        = Candy.Failures or {}
-Candy.Plan            = nil
-P.candy               = Candy
-P.version             = 13
-
--- The queued loader sets this before re-running the script after a rejoin. It
--- tells the new copy whether the player was farming when kicked, so it can
--- fling the murderer if the same round is still in progress.
-local rejoinIntent = nil
-do
-    local ok, stored = pcall(function()
-        return genv.__mm2candy_rejoin
-    end)
-    if ok and type(stored) == "table" then
-        genv.__mm2candy_rejoin = nil
-        local age = os.time() - (tonumber(stored.at) or 0)
-        if age >= 0 and age <= 300 then
-            rejoinIntent = stored
-        end
+-- Single owner of root motion. Only one of these may run at a time.
+local Motion = {
+    tween       = nil,
+    shooting    = false,
+    teleporting = false,
+    lastShot    = 0,
+    lockUntil   = 0,
+}
+function Motion.cancelTween()
+    if Motion.tween then
+        pcall(function() Motion.tween:Cancel() end)
+        Motion.tween = nil
     end
 end
-
-local pendingRejoinKickRevenge = rejoinIntent ~= nil
-    and rejoinIntent.kick == true
-    and rejoinIntent.farming == true
-
-local Config = {
-    DebugLog             = false,
-    -- Start farming as soon as the script loads; Home still pauses/resumes it.
-    AutoStart             = true,
-    TeleportShootCooldown = 1.5,
-    AutoCombat            = true,
-    HideUnderMap          = true,
-    HideDepth             = 120,
-    Noclip                = true,
-    -- Murderer sync: stand this many studs directly behind the murderer,
-    -- re-assert the CFrame for every shot, and aim with no prediction.
-    SyncBehindDistance    = 3,
-    SyncBehindHeight      = 1,
-    -- Hold the synced position this long before restoring the character. The
-    -- volley starts at SyncFireAt (the middle by default), giving the server
-    -- time to accept the hidden physics sync before the shot is sent.
-    SyncHoldTime          = 1.0,
-    SyncFireAt            = 0.5,
-    SyncVolleyShots       = 4,
-    SyncShotInterval      = 0.08,
-    MissRetryDelay        = 4,
-    -- Kick/disconnect handling. Uses GuiService.ErrorMessageChanged and the
-    -- same wait()+TeleportService:Teleport flow as the proven mobile snippet.
-    AutoRejoin               = true,
-    -- If no round starts for this long, hop to a different public server.
-    AutoRejoinNoRoundTimeout = 90,
-    -- Server hop choice: prefer servers at least half full, then the lowest
-    -- ping. ServerHopPages controls how many 100-server pages are searched.
-    ServerHopMinFill         = 0.5,
-    ServerHopPages           = 2,
-    ServerHopRetryDelay      = 5,
-    ServerHopAllowFallback   = true,
-    -- Queue this loader before the rejoin teleport. After the client lands in
-    -- the new server the executor runs it, fetches the current script, and
-    -- starts farming again automatically. Set QueueReexecute to false to only
-    -- rejoin without re-running the script.
-    QueueReexecute        = true,
-    ReexecuteUrl          = "https://raw.githubusercontent.com/goldoomen310-cpu/no/refs/heads/main/id",
-    -- Movement tuning: unanchor when this fraction of the leg is complete so
-    -- the final approach can fire touch interest early, and how long the
-    -- stationary pickup finisher waits if the early touch did not register.
-    MoveUnanchorAt        = 0.8,
-    EarlyTouchDistance    = 5,
-    PickupFinishTime      = 0.12,
-}
-
-local roundActive     = false
-local roundStartTime  = 0
-local roundWaitingSince = tick()
-local roundSerial     = 0
-local runSerial       = 0
-local playerData      = {}
-local playerDataBusy  = false
-
-local isShooting      = false
-local isTeleporting   = false
-local lastTeleportShot = 0
-
-local activeTween = nil
-
--- Assigned in the "WAITING FOR YOUR TURN" section further down. Declared here
--- so collectCandy and farmRound can poll it.
-local pollWaitingForTurn, handleWaitingForTurn
+function Motion.busy()
+    return Motion.shooting or Motion.teleporting
+        or Revenge.active or Fling.enabled
+end
 
 -- ==================== SMALL HELPERS ====================
 local function dbg(...)
-    if Config.DebugLog then
-        print("[candy]", ...)
-    end
+    if Config.DebugLog then print("[candy]", ...) end
 end
 
 local function getRoot()
@@ -259,45 +240,32 @@ local function isAlive()
     return hum ~= nil and hum.Health > 0 and getRoot() ~= nil
 end
 
+local function workerOK(id)
+    if not instanceAlive() or not Candy.Enabled then return false end
+    if id and Candy.ActiveWorker ~= id then return false end
+    return true
+end
+
+local function bagTarget()
+    return math.max(1, tonumber(Candy.Cap) or Config.CandyCap)
+end
+
 local function playerFromCharacter(char)
     if not char then return nil end
     return Players:GetPlayerFromCharacter(char)
 end
 
-local function roleOf(player)
-    local d = playerData[player.Name]
-    return d and d.Role or nil
+local function planarDistance(a, b)
+    local dx, dz = a.X - b.X, a.Z - b.Z
+    return math.sqrt(dx * dx + dz * dz)
 end
 
-local function isDead(player)
-    local d = playerData[player.Name]
-    if d and d.Dead then return true end
-    local char = player.Character
-    if not char then return true end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    return hum == nil or hum.Health <= 0
-end
-
-local function myRole()
-    local me = playerData[LocalPlayer.Name]
-    return me and me.Role or nil
-end
-
-local function bagTarget()
-    local cap = tonumber(Candy.Cap) or CANDY_CAP
-    local limit = tonumber(Candy.MaxCandies) or CANDY_CAP
-    return math.max(1, math.min(cap, limit))
-end
-
--- The real authority is the candy bag UI, not our own event counter:
---   MainGUI.Game.CoinBags.Container.Candy.CurrencyFrame.Icon.Coins
-local candyCounterLabel = nil
-
-local function findCandyCounterLabel()
-    if candyCounterLabel and candyCounterLabel.Parent then
-        return candyCounterLabel
-    end
-
+-- ==================== CANDY BAG GUI ====================
+-- MainGUI.Game.CoinBags.Container.Candy.CurrencyFrame.Icon.Coins is the only
+-- authority for a full bag.
+local Bag = { label = nil }
+function Bag.findLabel()
+    if Bag.label and Bag.label.Parent then return Bag.label end
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     local main = pg and pg:FindFirstChild("MainGUI")
     local gameGui = main and main:FindFirstChild("Game")
@@ -310,19 +278,17 @@ local function findCandyCounterLabel()
     local icon = currency and currency:FindFirstChild("Icon")
     local label = icon and icon:FindFirstChild("Coins")
     if label and label:IsA("TextLabel") then
-        candyCounterLabel = label
+        Bag.label = label
         return label
     end
 
-    -- Fallback if the bag hierarchy moves: find a Coins label whose bag frame
-    -- is actually named Candy.
     for _, obj in ipairs(bags:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Name == "Coins" then
             local iconParent = obj.Parent
             local currencyParent = iconParent and iconParent.Parent
             local bagParent = currencyParent and currencyParent.Parent
             if bagParent and bagParent.Name == "Candy" then
-                candyCounterLabel = obj
+                Bag.label = obj
                 return obj
             end
         end
@@ -330,57 +296,1052 @@ local function findCandyCounterLabel()
     return nil
 end
 
-local function readCandyGuiCount()
-    local label = findCandyCounterLabel()
+function Bag.count()
+    local label = Bag.findLabel()
     if not label then return nil end
-    local raw = tostring(label.Text):gsub(",", "")
-    local digits = raw:match("%d+")
-    if not digits then return nil end
-    return tonumber(digits)
+    local digits = tostring(label.Text):gsub(",", ""):match("%d+")
+    return digits and tonumber(digits) or nil
 end
 
-local function refreshCollectedFromGui()
-    local n = readCandyGuiCount()
-    if n then
-        Candy.GuiCount = n
-        Candy.Collected = n
-    end
+function Bag.refresh()
+    local n = Bag.count()
+    if n then Candy.Collected = n end
     return n
 end
 
-local function bagFull()
-    -- For ~0.8s after a round's reset the UI can still show last round's value.
-    if Candy.GuiReadyAt and tick() < Candy.GuiReadyAt then
-        return false
-    end
-    local guiCount = refreshCollectedFromGui()
-    if guiCount then
-        return guiCount >= bagTarget()
-    end
+function Bag.full()
+    if Candy.GuiReadyAt and tick() < Candy.GuiReadyAt then return false end
+    local guiCount = Bag.refresh()
+    if guiCount then return guiCount >= bagTarget() end
     return Candy.Collected >= bagTarget()
 end
 
-local function cancelTween()
-    if activeTween then
-        pcall(function() activeTween:Cancel() end)
-        activeTween = nil
+-- ==================== UNDER-MAP HIDE (VOID-SAFE) ====================
+local Hide = {
+    active         = false,
+    conn           = nil,
+    watchConn      = nil,
+    cf             = nil,
+    savedCF        = nil,
+    safeCF         = nil,
+    floorY         = nil,
+    health         = nil,
+    blockedUntil   = 0,
+    hideDeaths     = 0,
+    voidRecoveries = 0,
+    surfaceY       = nil,
+    lastSafeCF     = nil,
+    lastProbe      = 0,
+    lastY          = nil,
+    MIN_CLEAR      = Config.HideMinFloorClearance,
+}
+
+function Hide.params()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    params.IgnoreWater = true
+    return params
+end
+
+function Hide.floorAt(x, z, fromY, dist)
+    local params = Hide.params()
+    local hit = Workspace:Raycast(
+        Vector3.new(x, fromY, z),
+        Vector3.new(0, -(dist or 5000), 0),
+        params
+    )
+    return hit and hit.Position.Y or nil
+end
+
+-- Highest floor within ~16 studs of the column. The character must be at (or
+-- near) the surface: if it is already well below the last known surface this
+-- returns nil so hiding can never chase the character further down.
+function Hide.findFloor(root)
+    if not root then return nil end
+    local pos = root.Position
+    if Hide.surfaceY and pos.Y < Hide.surfaceY - 60 then return nil end
+
+    local fromY = pos.Y + 30
+    local offsets = {
+        { 0, 0 }, { 8, 0 }, { -8, 0 }, { 0, 8 }, { 0, -8 },
+        { 16, 16 }, { -16, 16 }, { 16, -16 }, { -16, -16 },
+    }
+    local best
+    for _, off in ipairs(offsets) do
+        local y = Hide.floorAt(pos.X + off[1], pos.Z + off[2], fromY, 800)
+        if y and (not best or y > best) then best = y end
+    end
+    if not best then return nil end
+    -- Refuse floors absurdly far below the character (map edge / void).
+    if pos.Y - best > 200 then return nil end
+    return best
+end
+
+function Hide.hideYForFloor(floorY)
+    local depth = math.clamp(tonumber(Config.HideDepth) or 120, Config.HideMinDepth, Config.HideMaxDepth)
+    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+    local minY = destroyY + Hide.MIN_CLEAR + 10
+    local hideY = floorY - depth
+    if hideY < minY then
+        hideY = math.max(minY, floorY - Config.HideMinDepth)
+    end
+    if hideY >= floorY - 5 then return nil end
+    return hideY
+end
+
+function Hide.hideCFFor(root)
+    local floorY = Hide.findFloor(root)
+    if not floorY then return nil end
+    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+    if floorY <= destroyY + Hide.MIN_CLEAR then return nil end
+    local hideY = Hide.hideYForFloor(floorY)
+    if not hideY then return nil end
+    local rotation = root.CFrame - root.CFrame.Position
+    local cf = CFrame.new(root.Position.X, hideY, root.Position.Z) * rotation
+    local safe = CFrame.new(root.Position.X, floorY + 5, root.Position.Z)
+    return cf, floorY, safe
+end
+
+-- A stored surface CFrame is only trustworthy if there is still solid ground
+-- directly under it. This rejects old-map coordinates after a map swap.
+function Hide.cfSafe(cf)
+    if not cf then return false end
+    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+    if cf.Position.Y <= destroyY + Hide.MIN_CLEAR then return false end
+    local y = Hide.floorAt(cf.Position.X, cf.Position.Z, cf.Position.Y + 15, 400)
+    if not y then return false end
+    if cf.Position.Y - y > 15 then return false end
+    return true
+end
+
+function Hide.spawnCF()
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("SpawnLocation") and obj.Enabled ~= false then
+            return CFrame.new(obj.Position + Vector3.new(0, 5, 0))
+        end
+    end
+    return nil
+end
+
+function Hide.bestSafeCF()
+    if Hide.cfSafe(Hide.lastSafeCF) then return Hide.lastSafeCF + Vector3.new(0, 2, 0) end
+    if Hide.cfSafe(Hide.safeCF) then return Hide.safeCF end
+    if Hide.cfSafe(Hide.savedCF) then return Hide.savedCF end
+    local spawn = Hide.spawnCF()
+    if spawn then return spawn end
+    local root = getRoot()
+    if root then
+        local y = Hide.floorAt(root.Position.X, root.Position.Z, 1500, 3000)
+        if y then return CFrame.new(root.Position.X, y + 5, root.Position.Z) end
+    end
+    return CFrame.new(0, 200, 0)
+end
+
+function Hide.clear()
+    local wasActive = Hide.active
+    if Hide.conn then
+        pcall(function() Hide.conn:Disconnect() end)
+        Hide.conn = nil
+    end
+    Hide.active = false
+    Candy.Hidden = false
+    Hide.cf = nil
+    Hide.savedCF = nil
+    Hide.safeCF = nil
+    Hide.floorY = nil
+    Hide.health = nil
+    if wasActive then
+        local root = getRoot()
+        if root then pcall(function() root.Anchored = false end) end
     end
 end
 
-local function clearCandyMemory()
-    Candy.SkipUntil = {}
-    Candy.Failures = {}
-    Candy.Plan = nil
+function Hide.unhide(toCF)
+    local wasHidden = Hide.active
+    local savedCF = Hide.savedCF
+    local safeCF = Hide.safeCF
+    Hide.clear()
+
+    -- A plain unhide is a no-op unless we were actually hiding; otherwise
+    -- every combat/enable call would teleport the character for no reason.
+    if not wasHidden and not toCF then return end
+
+    local root = getRoot()
+    if not root or not isAlive() then return end
+
+    local target = toCF
+    if not target then
+        if Hide.cfSafe(savedCF) then
+            target = savedCF
+        elseif Hide.cfSafe(safeCF) then
+            target = safeCF
+        else
+            target = Hide.bestSafeCF()
+        end
+    end
+    if not target then return end
+
+    root.Anchored = false
+    root.CFrame = target
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 end
 
-local function freezePhysics()
+function Hide.recover(reason)
+    dbg("void recovery:", tostring(reason))
     local root = getRoot()
-    if root then
-        root.AssemblyLinearVelocity  = Vector3.zero
+    Hide.clear()
+
+    Hide.voidRecoveries = Hide.voidRecoveries + 1
+    if Hide.voidRecoveries >= 2 then
+        Hide.blockedUntil = math.max(Hide.blockedUntil, tick() + 180)
+        dbg("hiding paused after repeated void recoveries")
+    end
+
+    if Fling.enabled and type(Fling.stop) == "function" then
+        pcall(Fling.stop)
+    end
+    Motion.cancelTween()
+
+    if root and isAlive() then
+        local target = Hide.bestSafeCF()
+        if target then
+            root.Anchored = false
+            root.CFrame = target
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+    Hide.blockedUntil = math.max(Hide.blockedUntil, tick() + 3)
+end
+
+function Hide.hide()
+    if not Config.HideUnderMap then return false end
+    if not instanceAlive() or not Candy.Enabled then return false end
+    if Hide.active then return true end
+    if tick() < Hide.blockedUntil then return false end
+    if not isAlive() then return false end
+    if Motion.busy() or Motion.tween then return false end
+
+    local root = getRoot()
+    if not root then return false end
+
+    -- Never hide if the body is already below the known surface; recover
+    -- upward instead of dragging it deeper into the void.
+    if Hide.surfaceY and root.Position.Y < Hide.surfaceY - 80 then
+        Hide.recover("hide requested below the surface")
+        return false
+    end
+
+    local cf, floorY, safeCF = Hide.hideCFFor(root)
+    if not cf then
+        dbg("hide skipped: no valid floor")
+        return false
+    end
+
+    Hide.savedCF = root.CFrame
+    Hide.cf = cf
+    Hide.floorY = floorY
+    Hide.safeCF = safeCF
+    Hide.active = true
+    Candy.Hidden = true
+    local hum = getHumanoid()
+    Hide.health = hum and hum.Health or nil
+
+    -- Anchoring removes the gravity-vs-heartbeat race entirely, so a throttled
+    -- client can never fall from the hide point into the destroy plane.
+    root.Anchored = true
+    root.CFrame = cf
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+
+    if Hide.conn then Hide.conn:Disconnect() end
+    Hide.conn = RunService.Heartbeat:Connect(Hide.hold)
+    return true
+end
+
+function Hide.hold()
+    if not Hide.active or not instanceAlive() then return end
+    if not isAlive() then
+        Hide.clear()
+        return
+    end
+    -- Another system owns the root now; hand it over instead of fighting.
+    if Motion.shooting or Motion.teleporting or Motion.tween or Fling.enabled then
+        Hide.clear()
+        return
+    end
+
+    local root = getRoot()
+    if not root then return end
+
+    local hum = getHumanoid()
+    if hum then
+        if Hide.health and hum.Health < Hide.health - 0.01 then
+            Hide.recover("damage while hidden")
+            return
+        end
+        Hide.health = hum.Health
+    end
+
+    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+    if root.Position.Y <= destroyY + Hide.MIN_CLEAR then
+        Hide.recover("below destroy height")
+        return
+    end
+    if Hide.cf and root.Position.Y < Hide.cf.Position.Y - 40 then
+        Hide.recover("fell below hide point")
+        return
+    end
+
+    if Hide.cf and (root.Position - Hide.cf.Position).Magnitude > 60 then
+        if Hide.floorY and root.Position.Y < Hide.floorY - 10 then
+            Hide.recover("moved below the floor")
+            return
+        end
+        local cf, floorY, safeCF = Hide.hideCFFor(root)
+        if not cf then
+            Hide.recover("new map has no floor")
+            return
+        end
+        Hide.savedCF = root.CFrame
+        Hide.cf = cf
+        Hide.floorY = floorY
+        Hide.safeCF = safeCF
+    end
+
+    if Hide.cf then
+        root.Anchored = true
+        root.CFrame = Hide.cf
+        root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     end
 end
 
+function Hide.unhideForCandy(target)
+    if not target or not Hide.active then return end
+    Hide.unhide(CFrame.new(target.obj.Position + Vector3.new(0, 3.5, 0)))
+end
+
+function Hide.resetRound()
+    Hide.hideDeaths = 0
+    Hide.voidRecoveries = 0
+    Hide.blockedUntil = 0
+    Hide.surfaceY = nil
+    Hide.lastSafeCF = nil
+    Hide.clear()
+end
+
+-- Always-on watchdog: rescues the body if it ever drops toward the destroy
+-- plane, and records the last verified surface CFrame used by recovery.
+function Hide.startWatch()
+    if Hide.watchConn then return end
+    Hide.watchConn = RunService.Heartbeat:Connect(function()
+        if not instanceAlive() or not Candy.Enabled then return end
+        local root = getRoot()
+        if not root or not isAlive() then return end
+
+        local pos = root.Position
+        Hide.lastY = pos.Y
+        local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+
+        if pos.Y <= destroyY + 60 then
+            Hide.recover("watchdog: below destroy plane")
+            return
+        end
+
+        if not Hide.active and not Motion.busy() then
+            local now = tick()
+            if now - Hide.lastProbe >= 0.35 then
+                Hide.lastProbe = now
+                local floor = Hide.floorAt(pos.X, pos.Z, pos.Y + 20, 200)
+                local hum = getHumanoid()
+                local grounded = hum and hum.FloorMaterial ~= Enum.Material.Air
+                if floor and (grounded or (pos.Y - floor) < 6) and pos.Y > destroyY + 120 then
+                    Hide.lastSafeCF = CFrame.new(pos)
+                    Hide.surfaceY = floor
+                    Hide.voidRecoveries = 0
+                end
+            end
+        end
+
+        if not Hide.active and not Motion.busy() and not Motion.tween
+            and Hide.surfaceY and pos.Y < Hide.surfaceY - 220 then
+            Hide.recover("watchdog: far below the surface")
+        end
+    end)
+end
+
+function Hide.stopWatch()
+    if Hide.watchConn then
+        pcall(function() Hide.watchConn:Disconnect() end)
+        Hide.watchConn = nil
+    end
+    Hide.clear()
+end
+
+-- ==================== NOCLIP ====================
+local Noclip = {
+    enabled = false, conns = {}, charConn = nil,
+    saved = {}, partConns = {}, tracked = nil, descConn = nil,
+}
+function Noclip.part(part)
+    if not part:IsA("BasePart") then return end
+    if Noclip.saved[part] == nil then
+        Noclip.saved[part] = part.CanCollide
+        Noclip.partConns[part] = part:GetPropertyChangedSignal("CanCollide"):Connect(function()
+            if Noclip.enabled and part.CanCollide then
+                part.CanCollide = false
+            end
+        end)
+    end
+    if part.CanCollide then part.CanCollide = false end
+end
+function Noclip.apply(char)
+    if not Noclip.enabled then return end
+    char = char or LocalPlayer.Character
+    if not char then return end
+    if Noclip.tracked ~= char then
+        if Noclip.descConn then
+            pcall(function() Noclip.descConn:Disconnect() end)
+            Noclip.descConn = nil
+        end
+        Noclip.tracked = char
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then Noclip.part(part) end
+        end
+        Noclip.descConn = char.DescendantAdded:Connect(function(descendant)
+            if descendant:IsA("BasePart") then Noclip.part(descendant) end
+        end)
+        return
+    end
+    for part in pairs(Noclip.saved) do
+        if part and part.Parent and part:IsA("BasePart") and part.CanCollide then
+            part.CanCollide = false
+        end
+    end
+end
+function Noclip.dropPartConns()
+    if Noclip.descConn then
+        pcall(function() Noclip.descConn:Disconnect() end)
+        Noclip.descConn = nil
+    end
+    Noclip.tracked = nil
+    for _, conn in pairs(Noclip.partConns) do
+        if conn then pcall(function() conn:Disconnect() end) end
+    end
+    table.clear(Noclip.partConns)
+end
+function Noclip.enable()
+    if not Config.Noclip then return end
+    if not Noclip.enabled then
+        Noclip.enabled = true
+        Noclip.saved = {}
+        Noclip.dropPartConns()
+        table.insert(Noclip.conns, RunService.Stepped:Connect(function()
+            Noclip.apply()
+        end))
+        if Noclip.charConn then Noclip.charConn:Disconnect() end
+        Noclip.charConn = onCharacterAdded(function(char)
+            if not instanceAlive() then return end
+            Noclip.dropPartConns()
+            Noclip.saved = {}
+            Noclip.apply(char)
+            task.delay(0.2, function()
+                if instanceAlive() and LocalPlayer.Character == char then
+                    Noclip.apply(char)
+                end
+            end)
+        end)
+    end
+    Noclip.apply()
+end
+function Noclip.disable()
+    Noclip.enabled = false
+    for _, conn in ipairs(Noclip.conns) do
+        if conn then pcall(function() conn:Disconnect() end) end
+    end
+    table.clear(Noclip.conns)
+    if Noclip.charConn then
+        pcall(function() Noclip.charConn:Disconnect() end)
+        Noclip.charConn = nil
+    end
+    Noclip.dropPartConns()
+    for part, canCollide in pairs(Noclip.saved) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = canCollide end)
+        end
+    end
+    Noclip.saved = {}
+end
+
+-- ==================== FARM ANIMATION LOCK ====================
+local AnimLock = {
+    enabled = false, conn = nil, track = nil, animator = nil,
+    lastSweep = 0, loadedAt = 0, retries = 0, resolved = false,
+    savedAnimates = {},
+    emoteId = "71336154532229",
+    animationId = "rbxassetid://130449961562896",
+}
+do
+    local function resolveId()
+        local ok, objects = pcall(function()
+            return game:GetObjects("rbxassetid://" .. AnimLock.emoteId)
+        end)
+        if not ok or type(objects) ~= "table" then return nil end
+        local found
+        local function findAnim(obj)
+            if found then return true end
+            if obj:IsA("Animation") then
+                local digits = tostring(obj.AnimationId):match("(%d+)")
+                if digits then
+                    found = digits
+                    return true
+                end
+            end
+            for _, child in ipairs(obj:GetChildren()) do
+                if findAnim(child) then return true end
+            end
+            return false
+        end
+        for _, obj in ipairs(objects) do
+            findAnim(obj)
+            pcall(function() obj:Destroy() end)
+        end
+        return found and ("rbxassetid://" .. found) or nil
+    end
+
+    function AnimLock.ensure()
+        if not AnimLock.enabled then return end
+        local char = LocalPlayer.Character
+        if not char then return end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local animator = hum and hum:FindFirstChildOfClass("Animator")
+        if not animator then return end
+
+        local animate = char:FindFirstChild("Animate")
+        if animate and animate:IsA("LocalScript") then
+            if AnimLock.savedAnimates[animate] == nil then
+                AnimLock.savedAnimates[animate] = animate.Disabled
+            end
+            if not animate.Disabled then animate.Disabled = true end
+        end
+
+        if AnimLock.animator ~= animator then
+            if AnimLock.track then
+                pcall(function() AnimLock.track:Stop(0) end)
+            end
+            for script, wasDisabled in pairs(AnimLock.savedAnimates) do
+                if not script.Parent then AnimLock.savedAnimates[script] = nil end
+            end
+            AnimLock.animator = animator
+            AnimLock.track = nil
+
+            if not AnimLock.resolved then
+                AnimLock.resolved = true
+                local resolved = resolveId()
+                if resolved then AnimLock.animationId = resolved end
+            end
+
+            local anim = Instance.new("Animation")
+            anim.AnimationId = AnimLock.animationId
+            local ok, track = pcall(function()
+                return animator:LoadAnimation(anim)
+            end)
+            if ok and track then
+                track.Looped = true
+                track.Priority = Enum.AnimationPriority.Action4
+                AnimLock.track = track
+                AnimLock.loadedAt = tick()
+            end
+        end
+
+        if AnimLock.track then
+            pcall(function()
+                AnimLock.track.Priority = Enum.AnimationPriority.Action4
+            end)
+            if not AnimLock.track.IsPlaying then
+                pcall(function() AnimLock.track:Play(0.1, 1, 1) end)
+            end
+            if AnimLock.track.Length == 0 and tick() - AnimLock.loadedAt > 1.5
+                and AnimLock.retries < 2 then
+                AnimLock.retries = AnimLock.retries + 1
+                pcall(function() AnimLock.track:Stop(0) end)
+                AnimLock.track = nil
+                AnimLock.animator = nil
+            end
+        end
+
+        if AnimLock.track and AnimLock.track.IsPlaying then
+            local now = tick()
+            if now - AnimLock.lastSweep >= 0.2 then
+                AnimLock.lastSweep = now
+                for _, other in ipairs(animator:GetPlayingAnimationTracks()) do
+                    if other ~= AnimLock.track then
+                        pcall(function() other:Stop(0.1) end)
+                    end
+                end
+            end
+        end
+    end
+
+    function AnimLock.enable()
+        if AnimLock.enabled then
+            AnimLock.ensure()
+            return
+        end
+        AnimLock.enabled = true
+        AnimLock.lastSweep = 0
+        AnimLock.retries = 0
+        if not AnimLock.resolved then
+            AnimLock.resolved = true
+            local resolved = resolveId()
+            if resolved then AnimLock.animationId = resolved end
+        end
+        AnimLock.ensure()
+        if AnimLock.conn then AnimLock.conn:Disconnect() end
+        AnimLock.conn = RunService.Heartbeat:Connect(AnimLock.ensure)
+    end
+
+    function AnimLock.disable()
+        AnimLock.enabled = false
+        if AnimLock.conn then
+            AnimLock.conn:Disconnect()
+            AnimLock.conn = nil
+        end
+        if AnimLock.track then
+            pcall(function() AnimLock.track:Stop(0) end)
+            AnimLock.track = nil
+        end
+        AnimLock.animator = nil
+        for script, wasDisabled in pairs(AnimLock.savedAnimates) do
+            if script and script.Parent then
+                pcall(function() script.Disabled = wasDisabled end)
+            end
+        end
+        table.clear(AnimLock.savedAnimates)
+    end
+end
+
+-- ==================== PHYSICS REP ====================
+local Phys = {}
+do
+    local handleLib
+    local ok, lib = pcall(function() return getgenv().InstanceHandle end)
+    if ok and typeof(lib) == "table" and type(lib.new) == "function" then
+        handleLib = lib
+    end
+    function Phys.set(part, targetPart)
+        if not part or not targetPart then return false end
+        local good = pcall(function()
+            sethiddenproperty(part, "PhysicsRepRootPart", targetPart)
+        end)
+        if not good then return false end
+        if handleLib then
+            pcall(function()
+                sethiddenproperty(part, "PhysicsRepRootRef", handleLib.new(targetPart))
+            end)
+        end
+        return true
+    end
+    function Phys.clear(part)
+        if not part then return end
+        pcall(function() sethiddenproperty(part, "PhysicsRepRootPart", nil) end)
+        pcall(function() sethiddenproperty(part, "PhysicsRepRootRef", nil) end)
+    end
+end
+
+-- ==================== ROUND STATE ====================
+local Round = {
+    active = false, startTime = 0, waitingSince = tick(),
+    serial = 0, data = {}, busy = false, conns = {},
+}
+function Round.roleOf(player)
+    local d = Round.data[player.Name]
+    return d and d.Role or nil
+end
+function Round.myRole()
+    local me = Round.data[LocalPlayer.Name]
+    return me and me.Role or nil
+end
+function Round.isDead(player)
+    local d = Round.data[player.Name]
+    if d and d.Dead then return true end
+    local char = player.Character
+    if not char then return true end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum == nil or hum.Health <= 0
+end
+function Round.readTimer()
+    local part = Workspace:FindFirstChild("RoundTimerPart")
+    if not part then return nil, nil end
+    return tonumber(part:GetAttribute("Time")), tonumber(part:GetAttribute("RoundLength"))
+end
+function Round.markEnd(reason)
+    if Round.active then
+        dbg("round end", reason or "")
+        Round.waitingSince = tick()
+    elseif not Round.waitingSince then
+        Round.waitingSince = tick()
+    end
+    Round.active = false
+    Round.startTime = 0
+    Candy.Busy = false
+    Candy.Target = nil
+    Motion.cancelTween()
+    Scan.clearMemory()
+    Hide.unhide()
+end
+function Round.markStart(source, data)
+    if type(data) == "table" then Round.data = data end
+    Round.active = true
+    Round.startTime = tick()
+    Round.waitingSince = nil
+    Round.serial = Round.serial + 1
+    Candy.LastScan = 0
+    Candy.Cache = {}
+    Scan.clearMemory()
+    Hide.resetRound()
+    task.spawn(Round.refresh)
+    dbg("round start", source or "")
+end
+function Round.detect()
+    local timeLeft, roundLength = Round.readTimer()
+    if not timeLeft or timeLeft <= 2 then return false end
+    if not isAlive() then return false end
+    if not Round.myRole() then
+        task.spawn(Round.refresh)
+        return false
+    end
+    local len = roundLength or 180
+    local elapsed = math.clamp(len - timeLeft, 0, len)
+    Round.active = true
+    Round.startTime = tick() - elapsed
+    Round.waitingSince = nil
+    Round.serial = Round.serial + 1
+    Candy.LastScan = 0
+    Candy.Cache = {}
+    Hide.resetRound()
+    dbg("round already active, elapsed=", math.floor(elapsed))
+    return true
+end
+function Round.connect(src, name, fn)
+    local ev = src:FindFirstChild(name)
+    if not ev then return end
+    if not (ev:IsA("RemoteEvent") or ev:IsA("RemoteFunction")) then return end
+    local ok, conn = pcall(function()
+        if ev:IsA("RemoteEvent") then
+            return ev.OnClientEvent:Connect(function(...)
+                if not instanceAlive() then return end
+                local good, err = pcall(fn, ...)
+                if not good then warn("[round] " .. name .. ": " .. tostring(err)) end
+            end)
+        end
+        ev.OnClientInvoke = function(...)
+            if not instanceAlive() then return end
+            local good, err = pcall(fn, ...)
+            if not good then warn("[round] " .. name .. ": " .. tostring(err)) end
+        end
+        return nil
+    end)
+    if ok and conn then table.insert(Round.conns, conn) end
+end
+
+do
+    local Gameplay = S.ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Gameplay")
+
+    function Round.refresh()
+        if Round.busy then return end
+        Round.busy = true
+        task.spawn(function()
+            local ok, data = pcall(function()
+                return Gameplay.GetCurrentPlayerData:InvokeServer()
+            end)
+            if ok and type(data) == "table" then Round.data = data end
+            Round.busy = false
+        end)
+    end
+
+    function Round.waitRole(timeout)
+        local t0 = tick()
+        while tick() - t0 < (timeout or 3) do
+            local role = Round.myRole()
+            if role then return role end
+            task.spawn(Round.refresh)
+            task.wait(0.35)
+        end
+        return Round.myRole()
+    end
+
+    Round.connect(Gameplay, "RoundStart", function(_, data)
+        Round.markStart("RoundStart", data)
+    end)
+    Round.connect(Gameplay, "CoinsStarted", function()
+        if not Round.active then Round.markStart("CoinsStarted") end
+        Candy.LastScan = 0
+    end)
+    Round.connect(Gameplay, "RoleSelect", function(role)
+        if type(role) == "string" and role ~= "" then
+            Round.data[LocalPlayer.Name] = Round.data[LocalPlayer.Name] or {}
+            Round.data[LocalPlayer.Name].Role = role
+        end
+        task.spawn(Round.refresh)
+    end)
+    Round.connect(Gameplay, "PlayerDataChanged", function(data)
+        if type(data) == "table" then Round.data = data end
+    end)
+    Round.connect(Gameplay, "VictoryScreen", function() Round.markEnd("VictoryScreen") end)
+    Round.connect(Gameplay, "GameOver", function() Round.markEnd("GameOver") end)
+    Round.connect(Gameplay, "RoundEndFade", function() Round.markEnd("RoundEndFade") end)
+    Round.connect(Gameplay, "LoadingMap", function()
+        Round.markEnd("LoadingMap")
+        Candy.Cache = {}
+        Candy.LastScan = 0
+        Hide.surfaceY = nil
+        Hide.lastSafeCF = nil
+    end)
+
+    local coin = Gameplay:FindFirstChild("CoinCollected")
+    if coin and coin:IsA("RemoteEvent") then
+        table.insert(Round.conns, coin.OnClientEvent:Connect(function(coinId, count, cap)
+            if coinId ~= nil and coinId ~= "Candy" then return end
+            if type(count) == "number" then
+                Candy.ServerCount = count
+                if not Bag.refresh() then Candy.Collected = count end
+            end
+            if type(cap) == "number" and cap > 0 then Candy.Cap = cap end
+        end))
+    end
+    task.defer(Round.refresh)
+end
+
+-- ==================== MURDERER LOOKUP ====================
+local Killer = {}
+function Killer.hasKnife(player)
+    player = player or LocalPlayer
+    local char = player.Character
+    if char and char:FindFirstChild("Knife") then return true end
+    local backpack = player:FindFirstChild("Backpack")
+    if not backpack and char then backpack = char:FindFirstChildOfClass("Backpack") end
+    return backpack ~= nil and backpack:FindFirstChild("Knife") ~= nil
+end
+function Killer.isLocal()
+    local role = Round.myRole()
+    if role then return role == "Murderer" end
+    return Killer.hasKnife(LocalPlayer)
+end
+function Killer.find()
+    local list = Players:GetPlayers()
+    for _, player in ipairs(list) do
+        if player ~= LocalPlayer and Round.roleOf(player) == "Murderer"
+            and not Round.isDead(player) then
+            return player
+        end
+    end
+    for _, player in ipairs(list) do
+        if player ~= LocalPlayer and Killer.hasKnife(player)
+            and not Round.isDead(player) then
+            return player
+        end
+    end
+    return nil
+end
+function Killer.exists()
+    if Killer.isLocal() then return true end
+    return Killer.find() ~= nil
+end
+function Killer.pos()
+    if Killer.isLocal() then return nil end
+    local killer = Killer.find()
+    local char = killer and killer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    return hrp and hrp.Position or nil
+end
+
+-- ==================== CANDY DETECTION ====================
+do
+    local VISUAL_NAMES = {
+        CoinVisual = true, SpinningVisual = true,
+        SpinningVisuals = true, MainCoin = true,
+    }
+    local ids = setmetatable({}, { __mode = "k" })
+    local nextId = 0
+
+    local function key(obj)
+        local id = ids[obj]
+        if not id then
+            nextId = nextId + 1
+            id = nextId
+            ids[obj] = id
+        end
+        return id
+    end
+
+    local function isCandyPart(obj)
+        if not obj or not obj:IsA("BasePart") then return false end
+        if VISUAL_NAMES[obj.Name] then return false end
+        if obj:GetAttribute("CoinID") == "Candy" then return true end
+        local lname = obj.Name:lower()
+        return lname:find("candy") ~= nil or lname:find("candie") ~= nil
+    end
+
+    local function available(obj)
+        if not obj or not obj.Parent then return false end
+        if obj:GetAttribute("Collected") == true then return false end
+        if obj:GetAttribute("Delete") == true then return false end
+        return true
+    end
+
+    local function containers()
+        local out = {}
+        for _, child in ipairs(Workspace:GetChildren()) do
+            local cc
+            if child.Name == "CoinContainer" then
+                cc = child
+            else
+                cc = child:FindFirstChild("CoinContainer")
+            end
+            if cc then out[#out + 1] = cc end
+        end
+        return out
+    end
+
+    function Scan.available(obj) return available(obj) end
+
+    function Scan.scan(root)
+        local list, cache = {}, {}
+        local playerPos = root.Position
+        for _, cc in ipairs(containers()) do
+            for _, obj in ipairs(cc:GetChildren()) do
+                if isCandyPart(obj) and available(obj) then
+                    cache[#cache + 1] = obj
+                    local d = (obj.Position - playerPos).Magnitude
+                    if d <= Candy.MaxDistance then
+                        list[#list + 1] = { obj = obj, dist = d }
+                    end
+                end
+            end
+        end
+        Candy.Cache = cache
+        Candy.LastScan = tick()
+        return list
+    end
+
+    function Scan.list(force)
+        local root = getRoot()
+        if not root then return {} end
+        local now = tick()
+        if force or (now - Candy.LastScan) > Config.CandyCacheTTL or #Candy.Cache == 0 then
+            return Scan.scan(root)
+        end
+        local list, playerPos = {}, root.Position
+        for _, obj in ipairs(Candy.Cache) do
+            if available(obj) then
+                local d = (obj.Position - playerPos).Magnitude
+                if d <= Candy.MaxDistance then
+                    list[#list + 1] = { obj = obj, dist = d }
+                end
+            end
+        end
+        if #list == 0 then return Scan.scan(root) end
+        return list
+    end
+
+    -- Reject candy that sits in the void: at/below the destroy plane, or far
+    -- under the surface with no floor underneath it.
+    function Scan.safeAt(obj, killerPos)
+        if not obj or not obj.Parent then return false end
+        local pos = obj.Position
+        local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+        if pos.Y <= destroyY + 60 then return false end
+        if Hide.surfaceY and pos.Y < Hide.surfaceY - 200 then
+            if not Hide.floorAt(pos.X, pos.Z, pos.Y + 40, 600) then
+                return false
+            end
+        end
+        if killerPos then
+            local horizontal = planarDistance(pos, killerPos)
+            if horizontal <= Config.KillerIgnoreRadius
+                and math.abs(pos.Y - killerPos.Y) <= Config.KillerIgnoreHeight then
+                return false
+            end
+        end
+        return true
+    end
+
+    function Scan.safe(obj)
+        return Scan.safeAt(obj, Killer.pos())
+    end
+
+    function Scan.best(list)
+        local root = getRoot()
+        if not root then return nil end
+        local origin = (Hide.active and Hide.savedCF) and Hide.savedCF.Position or root.Position
+        local now = tick()
+        local killerPos = Killer.pos()
+        local best, bestDist, bestKey
+        local soonestBlocked = math.huge
+
+        for _, c in ipairs(list) do
+            local obj = c.obj
+            if available(obj) and Scan.safeAt(obj, killerPos) then
+                local blockedUntil = Candy.SkipUntil[obj]
+                if blockedUntil and blockedUntil > now then
+                    if blockedUntil < soonestBlocked then soonestBlocked = blockedUntil end
+                else
+                    local pos = obj.Position
+                    local dist = (pos - origin).Magnitude
+                    local k = key(obj)
+                    if not best
+                        or dist < bestDist
+                        or (dist == bestDist and k < bestKey) then
+                        best = { obj = obj, pos = pos, dist = dist, key = k }
+                        bestDist = dist
+                        bestKey = k
+                    end
+                end
+            end
+        end
+
+        if not best then
+            Candy.Plan = nil
+            if soonestBlocked < math.huge then
+                return nil, math.max(0.05, soonestBlocked - now)
+            end
+            return nil
+        end
+
+        Candy.Plan = {
+            first = best.obj,
+            count = 1,
+            distance = best.dist,
+            route = { best.obj },
+        }
+        return best
+    end
+
+    function Scan.markFailure(obj)
+        if not obj then return end
+        local rec = Candy.Failures[obj]
+        if not rec then
+            rec = { count = 0 }
+            Candy.Failures[obj] = rec
+        end
+        rec.count = rec.count + 1
+        local cooldown = math.min(30, 0.6 * (2 ^ (rec.count - 1)))
+        Candy.SkipUntil[obj] = tick() + cooldown
+        dbg("candy failed", obj:GetFullName(), "attempts", rec.count, "cooldown", cooldown)
+    end
+
+    function Scan.clearMemory()
+        Candy.SkipUntil = {}
+        Candy.Failures = {}
+        Candy.Plan = nil
+    end
+end
+
+-- ==================== MOVEMENT / COLLECTION ====================
 local function fireTouch(partA, partB)
     if not partA or not partB then return end
     pcall(function()
@@ -389,1026 +1350,13 @@ local function fireTouch(partA, partB)
     end)
 end
 
--- ==================== NOCLIP ====================
--- Kept on for the whole time the farm is enabled, including idle/under-map
--- time, so walls can never block a route. Every BasePart of the character is
--- forced non-collidable on both Stepped and Heartbeat, and a per-part property
--- watcher flips it straight back if the game or the physics step re-enables it,
--- so nothing can ever catch the character on a wall mid-move. Original values
--- are restored when the farm is toggled off.
-local noclipEnabled       = false
-local noclipConnections   = {}
-local noclipCharacterConn = nil
-local noclipSaved         = {}
-local noclipPartConns     = {}
-
-local function noclipPart(part)
-    if not part:IsA("BasePart") then return end
-    if noclipSaved[part] == nil then
-        noclipSaved[part] = part.CanCollide
-        noclipPartConns[part] = part:GetPropertyChangedSignal("CanCollide"):Connect(function()
-            if noclipEnabled and part.CanCollide then
-                part.CanCollide = false
-            end
-        end)
-    end
-    if part.CanCollide then
-        part.CanCollide = false
-    end
-end
-
-local noclipTrackedCharacter = nil
-local noclipDescendantConn = nil
-
-local function applyNoclip(char)
-    if not noclipEnabled then return end
-    char = char or LocalPlayer.Character
-    if not char then return end
-
-    -- Only scan the hierarchy when attaching to a new character. During normal
-    -- frames, enforce collision state on the cached parts instead of repeatedly
-    -- calling GetDescendants() (which created avoidable frame-time spikes).
-    if noclipTrackedCharacter ~= char then
-        if noclipDescendantConn then
-            pcall(function() noclipDescendantConn:Disconnect() end)
-            noclipDescendantConn = nil
-        end
-        noclipTrackedCharacter = char
-        for _, part in ipairs(char:GetDescendants()) do
-            if part:IsA("BasePart") then noclipPart(part) end
-        end
-        noclipDescendantConn = char.DescendantAdded:Connect(function(descendant)
-            if descendant:IsA("BasePart") then noclipPart(descendant) end
-        end)
-        return
-    end
-
-    for part in pairs(noclipSaved) do
-        if part and part.Parent and part:IsA("BasePart") and part.CanCollide then
-            part.CanCollide = false
-        end
-    end
-end
-
-local function dropNoclipPartConns()
-    if noclipDescendantConn then
-        pcall(function() noclipDescendantConn:Disconnect() end)
-        noclipDescendantConn = nil
-    end
-    noclipTrackedCharacter = nil
-    for _, conn in pairs(noclipPartConns) do
-        if conn then pcall(function() conn:Disconnect() end) end
-    end
-    table.clear(noclipPartConns)
-end
-
-local function enableNoclip()
-    if not Config.Noclip then return end
-    if not noclipEnabled then
-        noclipEnabled = true
-        noclipSaved = {}
-        dropNoclipPartConns()
-
-        -- One pre-physics pass is enough; per-part property watchers and the
-        -- DescendantAdded listener handle most changes without a second full pass.
-        table.insert(noclipConnections, RunService.Stepped:Connect(function()
-            applyNoclip()
-        end))
-
-        if noclipCharacterConn then noclipCharacterConn:Disconnect() end
-        noclipCharacterConn = onCharacterAdded(function(char)
-            if not instanceAlive() then return end
-            dropNoclipPartConns()
-            noclipSaved = {}
-            applyNoclip(char)
-            task.delay(0.2, function()
-                if instanceAlive() and LocalPlayer.Character == char then
-                    applyNoclip(char)
-                end
-            end)
-        end)
-    end
-    applyNoclip()
-end
-
-local function disableNoclip()
-    noclipEnabled = false
-    for _, conn in ipairs(noclipConnections) do
-        if conn then pcall(function() conn:Disconnect() end) end
-    end
-    table.clear(noclipConnections)
-    if noclipCharacterConn then
-        noclipCharacterConn:Disconnect()
-        noclipCharacterConn = nil
-    end
-    dropNoclipPartConns()
-    for part, canCollide in pairs(noclipSaved) do
-        if part and part.Parent then
-            pcall(function() part.CanCollide = canCollide end)
-        end
-    end
-    noclipSaved = {}
-end
-
--- ==================== FARM ANIMATION LOCK ====================
--- One emote, forced to the highest priority and replayed whenever the game
--- tries to replace or stop it. The emote is a UGC emote, so its real animation
--- id is resolved out of the emote bundle; the raw animation itself plays fine
--- with Animator:LoadAnimation. The default Animate script is disabled so
--- idle/walk tracks cannot blend over it.
-local animLockEnabled    = false
-local animLockConnection = nil
-local animLockTrack      = nil
-local animLockAnimator   = nil
-local animLockLastSweep  = 0
-local animLockLoadedAt   = 0
-local animLockRetries    = 0
-local animLockResolved   = false
-local animLockSavedAnimate = {}
-
--- UGC emote assets wrap the real Animation instance. game:GetObjects returns
--- the bundle on executor thread context; take the AnimationId out of it.
-local function resolveFarmAnimationId()
-    local ok, objects = pcall(function()
-        return game:GetObjects("rbxassetid://" .. FARM_EMOTE_ID)
-    end)
-    if not ok or type(objects) ~= "table" then return nil end
-
-    local found
-    local function findAnim(obj)
-        if found then return true end
-        if obj:IsA("Animation") then
-            local digits = tostring(obj.AnimationId):match("(%d+)")
-            if digits then
-                found = digits
-                return true
-            end
-        end
-        for _, child in ipairs(obj:GetChildren()) do
-            if findAnim(child) then return true end
-        end
-        return false
-    end
-
-    for _, obj in ipairs(objects) do
-        findAnim(obj)
-        pcall(function() obj:Destroy() end)
-    end
-
-    if found then return "rbxassetid://" .. found end
-    return nil
-end
-
-local function ensureAnimationLock()
-    if not animLockEnabled then return end
-    local char = LocalPlayer.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    if not animator then return end
-
-    -- Keep the character's own Animate script muted, even if the game tries to
-    -- switch it back on.
-    local animate = char:FindFirstChild("Animate")
-    if animate and animate:IsA("LocalScript") then
-        if animLockSavedAnimate[animate] == nil then
-            animLockSavedAnimate[animate] = animate.Disabled
-        end
-        if not animate.Disabled then
-            animate.Disabled = true
-        end
-    end
-
-    if animLockAnimator ~= animator then
-        if animLockTrack then
-            pcall(function() animLockTrack:Stop(0) end)
-        end
-        for script, wasDisabled in pairs(animLockSavedAnimate) do
-            if not script.Parent then
-                animLockSavedAnimate[script] = nil
-            end
-        end
-
-        animLockAnimator = animator
-        animLockTrack = nil
-
-        if not animLockResolved then
-            animLockResolved = true
-            local resolved = resolveFarmAnimationId()
-            if resolved then FARM_ANIMATION_ID = resolved end
-        end
-
-        local anim = Instance.new("Animation")
-        anim.AnimationId = FARM_ANIMATION_ID
-        local ok, track = pcall(function()
-            return animator:LoadAnimation(anim)
-        end)
-        if ok and track then
-            track.Looped = true
-            track.Priority = Enum.AnimationPriority.Action4
-            animLockTrack = track
-            animLockLoadedAt = tick()
-        end
-    end
-
-    if animLockTrack then
-        pcall(function()
-            animLockTrack.Priority = Enum.AnimationPriority.Action4
-        end)
-        if not animLockTrack.IsPlaying then
-            pcall(function() animLockTrack:Play(0.1, 1, 1) end)
-        end
-
-        -- If the asset came back empty, reload once or twice before giving up
-        -- (e.g. right after a game update re-uploads the emote).
-        if animLockTrack.Length == 0 and tick() - animLockLoadedAt > 1.5
-            and animLockRetries < 2 then
-            animLockRetries = animLockRetries + 1
-            pcall(function() animLockTrack:Stop(0) end)
-            animLockTrack = nil
-            animLockAnimator = nil
-        end
-    end
-
-    -- Sweep other tracks a few times a second so gameplay animations cannot
-    -- take over the emote. Only sweep while our track is actually playing, so a
-    -- failed load cannot leave the character with no animation at all.
-    if animLockTrack and animLockTrack.IsPlaying then
-        local now = tick()
-        if now - animLockLastSweep >= 0.2 then
-            animLockLastSweep = now
-            for _, other in ipairs(animator:GetPlayingAnimationTracks()) do
-                if other ~= animLockTrack then
-                    pcall(function() other:Stop(0.1) end)
-                end
-            end
-        end
-    end
-end
-
-local function enableAnimationLock()
-    if animLockEnabled then
-        ensureAnimationLock()
-        return
-    end
-    animLockEnabled = true
-    animLockLastSweep = 0
-    animLockRetries = 0
-
-    if not animLockResolved then
-        animLockResolved = true
-        local resolved = resolveFarmAnimationId()
-        if resolved then FARM_ANIMATION_ID = resolved end
-    end
-    ensureAnimationLock()
-    if animLockConnection then animLockConnection:Disconnect() end
-    animLockConnection = RunService.Heartbeat:Connect(ensureAnimationLock)
-end
-
-local function disableAnimationLock()
-    animLockEnabled = false
-    if animLockConnection then
-        animLockConnection:Disconnect()
-        animLockConnection = nil
-    end
-    if animLockTrack then
-        pcall(function() animLockTrack:Stop(0) end)
-        animLockTrack = nil
-    end
-    animLockAnimator = nil
-    for script, wasDisabled in pairs(animLockSavedAnimate) do
-        if script and script.Parent then
-            pcall(function() script.Disabled = wasDisabled end)
-        end
-    end
-    table.clear(animLockSavedAnimate)
-end
-
--- ==================== UNDER-MAP HIDE ====================
--- This is not anchoring. A heartbeat holds the root at a fixed point below the
--- current map, so gravity cannot drop the character into the void. Home can
--- still cancel it instantly and put the character back on the surface.
---
--- The hide point is only valid when a real floor is found below the character.
--- If the raycast misses (map edge, map still loading, or the character already
--- fell below the map) the old code used the current Y and then subtracted the
--- hide depth again. Every heartbeat repeated that, walking the character down
--- into the void until it died, respawned, and was dragged straight back down.
--- The helpers below validate the floor, clamp the hide Y above the destroy
--- plane, and recover to a safe surface CFrame if anything goes wrong.
-local hidden           = false
-local hideConnection   = nil
-local hideCF           = nil
-local hideSavedCF      = nil
-local hideSafeCF       = nil
-local hideFloorY       = nil
-local hideHealth       = nil
-local hideBlockedUntil = 0
-local hideDeathCount   = 0
-local hideDamageCount  = 0
-
-local HIDE_MIN_FLOOR_CLEARANCE = 20
-local HIDE_MIN_DEPTH = 15
-local HIDE_MAX_DEPTH = 250
-
-local function hideRayParams()
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { LocalPlayer.Character }
-    params.IgnoreWater = true
-    return params
-end
-
-local function rayFloorAt(x, z, fromY)
-    local params = hideRayParams()
-    local hit = Workspace:Raycast(Vector3.new(x, fromY, z), Vector3.new(0, -5000, 0), params)
-    return hit and hit.Position.Y or nil
-end
-
-local function findFloorY(root)
-    if not root then return nil end
-    local pos = root.Position
-    local fromY = pos.Y + 30
-
-    -- The main cast is directly under the character. The offsets keep the farm
-    -- working at map edges where the exact XZ column has no floor.
-    local offsets = {
-        { 0, 0 }, { 8, 0 }, { -8, 0 }, { 0, 8 }, { 0, -8 },
-        { 16, 16 }, { -16, 16 }, { 16, -16 }, { -16, -16 },
-    }
-    local best
-    for _, off in ipairs(offsets) do
-        local y = rayFloorAt(pos.X + off[1], pos.Z + off[2], fromY)
-        if y and (not best or y > best) then
-            best = y
-        end
-    end
-    return best
-end
-
-local function hideYForFloor(floorY)
-    local depth = math.clamp(tonumber(Config.HideDepth) or 120, HIDE_MIN_DEPTH, HIDE_MAX_DEPTH)
-    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
-    local minY = destroyY + HIDE_MIN_FLOOR_CLEARANCE + 10
-    local hideY = floorY - depth
-    if hideY < minY then
-        hideY = math.max(minY, floorY - HIDE_MIN_DEPTH)
-    end
-    -- Never hide above the floor, and never inside the floor itself.
-    if hideY >= floorY - 5 then return nil end
-    return hideY
-end
-
-local function computeHideCF(root)
-    if not root then return nil end
-    local floorY = findFloorY(root)
-    if not floorY then return nil end
-
-    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
-    if floorY <= destroyY + HIDE_MIN_FLOOR_CLEARANCE then return nil end
-
-    local hideY = hideYForFloor(floorY)
-    if not hideY then return nil end
-
-    local rotation = root.CFrame - root.CFrame.Position
-    return CFrame.new(Vector3.new(root.Position.X, hideY, root.Position.Z)) * rotation, floorY
-end
-
-local function cfIsSafe(cf)
-    if not cf then return false end
-    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
-    if cf.Position.Y <= destroyY + HIDE_MIN_FLOOR_CLEARANCE then return false end
-    if hideFloorY and cf.Position.Y < hideFloorY - 5 then return false end
-    return true
-end
-
-local function surfaceCFFromHide()
-    if cfIsSafe(hideSafeCF) then return hideSafeCF end
-    if hideCF then
-        local y = (hideFloorY or (hideCF.Position.Y + (tonumber(Config.HideDepth) or 120))) + 5
-        local cf = CFrame.new(Vector3.new(hideCF.Position.X, y, hideCF.Position.Z))
-        if cfIsSafe(cf) then return cf end
-    end
-    return nil
-end
-
-local function clearHideState()
-    if hideConnection then
-        pcall(function() hideConnection:Disconnect() end)
-        hideConnection = nil
-    end
-    hidden = false
-    Candy.Hidden = false
-    hideCF = nil
-    hideSavedCF = nil
-    hideSafeCF = nil
-    hideFloorY = nil
-    hideHealth = nil
-end
-
-local function recoverFromVoid(reason)
-    local root = getRoot()
-    local target = surfaceCFFromHide()
-    dbg("void recovery:", tostring(reason), target and "surface" or "no-safe-cf")
-    clearHideState()
-    if root and target and isAlive() then
-        root.CFrame = target
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end
-    -- Do not immediately hide again after a bad hide point.
-    hideBlockedUntil = math.max(hideBlockedUntil, tick() + 3)
-end
-
-local function holdHidden()
-    if not hidden or not instanceAlive() then return end
-    if not isAlive() then
-        clearHideState()
-        return
-    end
-    local root = getRoot()
-    if not root then return end
-
-    local hum = getHumanoid()
-    if hum then
-        if hideHealth and hum.Health < hideHealth - 0.01 then
-            hideDamageCount = hideDamageCount + 1
-            -- The game is damaging us while hidden. That is the void/kill-plane
-            -- case; get out immediately instead of dying in a loop.
-            recoverFromVoid("damage while hidden")
-            return
-        end
-        hideHealth = hum.Health
-    end
-
-    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
-    if root.Position.Y <= destroyY + HIDE_MIN_FLOOR_CLEARANCE then
-        recoverFromVoid("below destroy height")
-        return
-    end
-    if hideCF and root.Position.Y < hideCF.Position.Y - 40 then
-        recoverFromVoid("fell below hide point")
-        return
-    end
-
-    -- The game teleports the character when a new map loads. Only recompute
-    -- from the surface; if the character is already under the map, never chase
-    -- it downward.
-    if hideCF and (root.Position - hideCF.Position).Magnitude > 60 then
-        if hideFloorY and root.Position.Y < hideFloorY - 10 then
-            recoverFromVoid("moved below the floor")
-            return
-        end
-        local newCF, newFloor = computeHideCF(root)
-        if newCF then
-            hideSavedCF = root.CFrame
-            hideCF = newCF
-            hideFloorY = newFloor
-            hideSafeCF = CFrame.new(Vector3.new(newCF.Position.X, newFloor + 5, newCF.Position.Z))
-        else
-            recoverFromVoid("new map has no floor")
-            return
-        end
-    end
-
-    if hideCF then
-        root.CFrame = hideCF
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end
-end
-
-local function hideCharacter()
-    if not Config.HideUnderMap or not Candy.Enabled then return false end
+local Move = {}
+function Move.to(goalPos, speed, stopFn, touchPart)
     if not instanceAlive() then return false end
-    if hidden then return true end
-    if tick() < hideBlockedUntil then return false end
-    if not isAlive() then return false end
-
-    local root = getRoot()
-    if not root then return false end
-
-    local cf, floorY = computeHideCF(root)
-    if not cf then
-        -- No floor under us (map loading / map edge / already in the void).
-        -- Staying on the surface is always better than hiding in nothing.
-        dbg("hide skipped: no floor")
-        return false
-    end
-
-    hideSavedCF = root.CFrame
-    hideCF = cf
-    hideFloorY = floorY
-    hideSafeCF = CFrame.new(Vector3.new(cf.Position.X, floorY + 5, cf.Position.Z))
-    hidden = true
-    Candy.Hidden = true
-    local hum = getHumanoid()
-    hideHealth = hum and hum.Health or nil
-
-    root.CFrame = hideCF
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
-
-    if hideConnection then hideConnection:Disconnect() end
-    hideConnection = RunService.Heartbeat:Connect(holdHidden)
-    return true
-end
-
-local function unhideCharacter(toCF)
-    if hideConnection then
-        hideConnection:Disconnect()
-        hideConnection = nil
-    end
-
-    local root = getRoot()
-    local target = toCF
-    if not target and hidden then
-        target = cfIsSafe(hideSavedCF) and hideSavedCF or surfaceCFFromHide()
-    end
-
-    if root and target and isAlive() then
-        root.CFrame = target
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end
-
-    hidden = false
-    Candy.Hidden = false
-    hideCF = nil
-    hideSavedCF = nil
-    hideSafeCF = nil
-    hideFloorY = nil
-    hideHealth = nil
-end
-
-local function unhideForCandy(target)
-    if not target then return end
-    if not hidden then return end
-    local p = target.obj.Position + Vector3.new(0, 3.5, 0)
-    unhideCharacter(CFrame.new(p))
-end
-
--- ==================== PHYSICS REP ====================
-local InstanceHandleLib = nil
-do
-    local ok, lib = pcall(function() return getgenv().InstanceHandle end)
-    if ok and typeof(lib) == "table" and type(lib.new) == "function" then
-        InstanceHandleLib = lib
-    end
-end
-
-local function setPhysicsRep(part, targetPart)
-    if not part or not targetPart then return false end
-    local ok = pcall(function()
-        sethiddenproperty(part, "PhysicsRepRootPart", targetPart)
-    end)
-    if not ok then return false end
-    if InstanceHandleLib then
-        pcall(function()
-            sethiddenproperty(part, "PhysicsRepRootRef", InstanceHandleLib.new(targetPart))
-        end)
-    end
-    return true
-end
-
-local function clearPhysicsRep(part)
-    if not part then return end
-    pcall(function() sethiddenproperty(part, "PhysicsRepRootPart", nil) end)
-    pcall(function() sethiddenproperty(part, "PhysicsRepRootRef", nil) end)
-end
-
--- ==================== PLAYER DATA ====================
-local function applyPlayerData(data)
-    if type(data) == "table" then
-        playerData = data
-    end
-end
-
-local function refreshPlayerData()
-    if playerDataBusy then return end
-    playerDataBusy = true
-    task.spawn(function()
-        local ok, data = pcall(function()
-            return Gameplay.GetCurrentPlayerData:InvokeServer()
-        end)
-        if ok and type(data) == "table" then
-            playerData = data
-        end
-        playerDataBusy = false
-    end)
-end
-
-local function waitForRole(timeout)
-    local t0 = tick()
-    while tick() - t0 < (timeout or 3) do
-        local role = myRole()
-        if role then return role end
-        task.spawn(refreshPlayerData)
-        task.wait(0.35)
-    end
-    return myRole()
-end
-
--- ==================== ROUND STATE ====================
-local function readTimer()
-    local part = Workspace:FindFirstChild("RoundTimerPart")
-    if not part then return nil, nil end
-    return tonumber(part:GetAttribute("Time")), tonumber(part:GetAttribute("RoundLength"))
-end
-
-local function markRoundEnd(reason)
-    if roundActive then
-        dbg("round end", reason or "")
-        roundWaitingSince = tick()
-    elseif not roundWaitingSince then
-        roundWaitingSince = tick()
-    end
-    roundActive = false
-    roundStartTime = 0
-    Candy.Busy = false
-    Candy.Target = nil
-    cancelTween()
-    clearCandyMemory()
-    unhideCharacter()
-end
-
-local function markRoundStart(source, data)
-    if type(data) == "table" then
-        playerData = data
-    end
-    roundActive = true
-    roundStartTime = tick()
-    roundWaitingSince = nil
-    roundSerial = roundSerial + 1
-    Candy.LastScan = 0
-    Candy.Cache = {}
-    clearCandyMemory()
-    hideDeathCount = 0
-    hideDamageCount = 0
-    hideBlockedUntil = 0
-    task.spawn(refreshPlayerData)
-    dbg("round start", source or "")
-end
-
--- Detect a round that was already running when the script was toggled on.
-local function detectActiveRound()
-    local timeLeft, roundLength = readTimer()
-    if not timeLeft or timeLeft <= 2 then
-        return false
-    end
-    if not isAlive() then
-        return false
-    end
-    if not myRole() then
-        task.spawn(refreshPlayerData)
-        return false
-    end
-
-    local len = roundLength or 180
-    local elapsed = math.clamp(len - timeLeft, 0, len)
-    roundActive = true
-    roundStartTime = tick() - elapsed
-    roundWaitingSince = nil
-    roundSerial = roundSerial + 1
-    Candy.LastScan = 0
-    Candy.Cache = {}
-    hideDeathCount = 0
-    hideDamageCount = 0
-    hideBlockedUntil = 0
-    dbg("round already active, elapsed=", math.floor(elapsed))
-    return true
-end
-
-local roundConnections = {}
-local function connectRound(src, name, fn)
-    local ev = src:FindFirstChild(name)
-    if not ev then return end
-    if not (ev:IsA("RemoteEvent") or ev:IsA("RemoteFunction")) then return end
-    local ok, conn = pcall(function()
-        if ev:IsA("RemoteEvent") then
-            return ev.OnClientEvent:Connect(function(...)
-                local good, err = pcall(fn, ...)
-                if not good then warn("[round] " .. name .. ": " .. tostring(err)) end
-            end)
-        else
-            ev.OnClientInvoke = function(...)
-                local good, err = pcall(fn, ...)
-                if not good then warn("[round] " .. name .. ": " .. tostring(err)) end
-            end
-            return nil
-        end
-    end)
-    if ok and conn then
-        table.insert(roundConnections, conn)
-    end
-end
-
-connectRound(Gameplay, "RoundStart", function(duration, data)
-    markRoundStart("RoundStart", data)
-end)
-connectRound(Gameplay, "CoinsStarted", function()
-    if not roundActive then
-        markRoundStart("CoinsStarted")
-    end
-    Candy.LastScan = 0
-end)
-connectRound(Gameplay, "RoleSelect", function(role)
-    if type(role) == "string" and role ~= "" then
-        playerData[LocalPlayer.Name] = playerData[LocalPlayer.Name] or {}
-        playerData[LocalPlayer.Name].Role = role
-    end
-    task.spawn(refreshPlayerData)
-end)
-connectRound(Gameplay, "PlayerDataChanged", function(data)
-    applyPlayerData(data)
-end)
-connectRound(Gameplay, "VictoryScreen", function() markRoundEnd("VictoryScreen") end)
-connectRound(Gameplay, "GameOver", function() markRoundEnd("GameOver") end)
-connectRound(Gameplay, "RoundEndFade", function() markRoundEnd("RoundEndFade") end)
-connectRound(Gameplay, "LoadingMap", function()
-    markRoundEnd("LoadingMap")
-    Candy.Cache = {}
-    Candy.LastScan = 0
-end)
-
-local coinCollected = Gameplay:FindFirstChild("CoinCollected")
-if coinCollected and coinCollected:IsA("RemoteEvent") then
-    table.insert(roundConnections, coinCollected.OnClientEvent:Connect(function(coinId, count, cap)
-        if coinId ~= nil and coinId ~= CANDY_VALUE then return end
-        if type(count) == "number" then
-            Candy.ServerCount = count
-            local guiCount = refreshCollectedFromGui()
-            if not guiCount then
-                Candy.Collected = count
-            end
-        end
-        if type(cap) == "number" and cap > 0 then
-            Candy.Cap = cap
-        end
-    end))
-end
-
-task.defer(refreshPlayerData)
-
--- ==================== CANDY DETECTION ====================
-local VISUAL_NAMES = {
-    CoinVisual = true,
-    SpinningVisual = true,
-    SpinningVisuals = true,
-    MainCoin = true,
-}
-
-local function isCandyPart(obj)
-    if not obj or not obj:IsA("BasePart") then return false end
-    if VISUAL_NAMES[obj.Name] then return false end
-    if obj:GetAttribute(CANDY_ATTR) == CANDY_VALUE then return true end
-    local lname = obj.Name:lower()
-    if lname:find("candy") or lname:find("candie") then return true end
-    return false
-end
-
-local function isAvailable(obj)
-    if not obj or not obj.Parent then return false end
-    if obj:GetAttribute("Collected") == true then return false end
-    if obj:GetAttribute("Delete") == true then return false end
-    return true
-end
-
-local function candyContainers()
-    local out = {}
-    for _, child in ipairs(Workspace:GetChildren()) do
-        local cc
-        if child.Name == "CoinContainer" then
-            cc = child
-        else
-            cc = child:FindFirstChild("CoinContainer")
-        end
-        if cc then out[#out + 1] = cc end
-    end
-    return out
-end
-
-local function scanCandies(root)
-    local list, cache = {}, {}
-    local playerPos = root.Position
-    for _, cc in ipairs(candyContainers()) do
-        for _, obj in ipairs(cc:GetChildren()) do
-            if isCandyPart(obj) and isAvailable(obj) then
-                cache[#cache + 1] = obj
-                local d = (obj.Position - playerPos).Magnitude
-                if d <= Candy.MaxDistance then
-                    list[#list + 1] = { obj = obj, dist = d }
-                end
-            end
-        end
-    end
-    Candy.Cache = cache
-    Candy.LastScan = tick()
-    return list
-end
-
-local function findCandies(force)
-    local root = getRoot()
-    if not root then return {} end
-    local now = tick()
-
-    if force or (now - Candy.LastScan) > Candy.CacheTTL or #Candy.Cache == 0 then
-        return scanCandies(root)
-    end
-
-    local list = {}
-    local playerPos = root.Position
-    for _, obj in ipairs(Candy.Cache) do
-        if isAvailable(obj) then
-            local d = (obj.Position - playerPos).Magnitude
-            if d <= Candy.MaxDistance then
-                list[#list + 1] = { obj = obj, dist = d }
-            end
-        end
-    end
-    if #list == 0 then
-        return scanCandies(root)
-    end
-    return list
-end
-
--- ==================== MURDERER DANGER DETECTION ====================
-local function hasKnifeOn(player)
-    player = player or LocalPlayer
-    local char = player.Character
-    if char and char:FindFirstChild("Knife") then return true end
-    local backpack = player:FindFirstChild("Backpack")
-    if not backpack and char then backpack = char:FindFirstChildOfClass("Backpack") end
-    return backpack ~= nil and backpack:FindFirstChild("Knife") ~= nil
-end
-
-local function isLocalMurderer()
-    local role = myRole()
-    if role then return role == "Murderer" end
-    return hasKnifeOn(LocalPlayer)
-end
-
-local function findMurdererPlayer()
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and roleOf(player) == "Murderer" and not isDead(player) then
-            return player
-        end
-    end
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and hasKnifeOn(player) and not isDead(player) then
-            return player
-        end
-    end
-    return nil
-end
-
--- A live round always has a murderer. If there is none, the round is over (or
--- the next one has not assigned roles yet), so the farm should just idle until
--- candy is visible again.
-local function murdererExists()
-    if isLocalMurderer() then return true end
-    return findMurdererPlayer() ~= nil
-end
-
-local function planarDistance(a, b)
-    local dx, dz = a.X - b.X, a.Z - b.Z
-    return math.sqrt(dx * dx + dz * dz)
-end
-
-local function murdererPosition()
-    if isLocalMurderer() then return nil end
-    local killer = findMurdererPlayer()
-    local char = killer and killer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    return hrp and hrp.Position or nil
-end
-
-local function candyIsSafeAt(obj, killerPos)
-    if not obj then return false end
-    if not killerPos then return true end
-
-    -- Ignored when inside a 10-stud horizontal radius and within 10 studs
-    -- above or below the murderer.
-    local horizontal = planarDistance(obj.Position, killerPos)
-    if horizontal > KILLER_IGNORE_RADIUS then return true end
-    return math.abs(obj.Position.Y - killerPos.Y) > KILLER_IGNORE_HEIGHT
-end
-
-local function candyIsSafe(obj)
-    return candyIsSafeAt(obj, murdererPosition())
-end
-
--- ==================== CANDY SELECTION ====================
--- Intentionally simple: always walk to the nearest safe, available candy.
--- A stable per-object key breaks exact-distance ties, so two candies at the
--- same distance can never make the chooser flip back and forth.
-local candyIds = setmetatable({}, { __mode = "k" })
-local nextCandyId = 0
-
-local function candyKey(obj)
-    local id = candyIds[obj]
-    if not id then
-        nextCandyId = nextCandyId + 1
-        id = nextCandyId
-        candyIds[obj] = id
-    end
-    return id
-end
-
-local function selectBestPath(list)
-    local root = getRoot()
-    if not root then return nil end
-    local origin = (hidden and hideSavedCF) and hideSavedCF.Position or root.Position
-    local now = tick()
-    local killerPos = murdererPosition()
-    local best, bestDist, bestKey
-    local soonestBlocked = math.huge
-
-    for _, c in ipairs(list) do
-        local obj = c.obj
-        if isAvailable(obj) and candyIsSafeAt(obj, killerPos) then
-            local blockedUntil = Candy.SkipUntil[obj]
-            if blockedUntil and blockedUntil > now then
-                if blockedUntil < soonestBlocked then
-                    soonestBlocked = blockedUntil
-                end
-            else
-                local pos = obj.Position
-                local dist = (pos - origin).Magnitude
-                local key = candyKey(obj)
-                if not best
-                    or dist < bestDist
-                    or (dist == bestDist and key < bestKey) then
-                    best = {
-                        obj = obj,
-                        pos = pos,
-                        dist = dist,
-                        key = key,
-                    }
-                    bestDist = dist
-                    bestKey = key
-                end
-            end
-        end
-    end
-
-    if not best then
-        Candy.Plan = nil
-        if soonestBlocked < math.huge then
-            -- Every safe candy is cooling down after a failed attempt. Wait
-            -- for the first one instead of diving under the map and back.
-            return nil, math.max(0.05, soonestBlocked - now)
-        end
-        return nil
-    end
-
-    Candy.Plan = {
-        first = best.obj,
-        count = 1,
-        distance = best.dist,
-        route = { best.obj },
-    }
-    return best
-end
-
-local function markCandyFailure(obj)
-    if not obj then return end
-    local rec = Candy.Failures[obj]
-    if not rec then
-        rec = { count = 0 }
-        Candy.Failures[obj] = rec
-    end
-    rec.count = rec.count + 1
-
-    -- A real candy normally succeeds in one attempt. Exponential backoff stops
-    -- a decorative/fake part (or a target the game keeps resetting) from being
-    -- picked over and over, which is what made the farm look frozen.
-    local cooldown = math.min(30, 0.6 * (2 ^ (rec.count - 1)))
-    Candy.SkipUntil[obj] = tick() + cooldown
-    dbg("candy failed", obj:GetFullName(), "attempts", rec.count, "cooldown", cooldown)
-end
-
--- Kept for API compatibility with older callers.
-local function selectNearest(list)
-    return selectBestPath(list)
-end
-
--- ==================== MOVEMENT / COLLECTION ====================
--- Each leg is a linear CFrame tween driven by Roblox's TweenService. The root
--- is anchored for the first 80% of the leg: that locks the vertical axis and
--- stops the humanoid/physics solver from snapping the character down every
--- frame, which is what made vertical movement jittery. For the final 20% the
--- root is unanchored and touch interest is fired as soon as the candy is close,
--- so the pickup can register before the tween even finishes. The original
--- gravity is always restored and there is no murderer avoidance; dangerous
--- candies are filtered by the picker.
-
-local function moveTo(goalPos, speed, stopFn, touchPart)
-    if isShooting or isTeleporting then return false end
-    if not instanceAlive() then return false end
+    if Motion.busy() then return false end
     if Config.Noclip then
-        enableNoclip()
-        applyNoclip()
+        Noclip.enable()
+        Noclip.apply()
     end
 
     local root = getRoot()
@@ -1420,18 +1368,12 @@ local function moveTo(goalPos, speed, stopFn, touchPart)
     local initialDistance = (goalPos - startPos).Magnitude
     if initialDistance < 0.05 then return true end
 
-    -- Only one CFrame tween may own the root. If an earlier move was
-    -- interrupted without cleanup, cancel it so the two cannot fight.
-    cancelTween()
-
+    Motion.cancelTween()
     local hum = getHumanoid()
     local autoRotate = hum and hum.AutoRotate
     if hum then hum.AutoRotate = false end
 
-    -- Anchor the root at the start. The tween still owns CFrame, but physics
-    -- can no longer push the character up/down between render steps.
     root.Anchored = true
-
     local originalGravity = Workspace.Gravity
     local goalCF = CFrame.new(goalPos) * root.CFrame.Rotation
     local duration = math.max(initialDistance / speed, 0.01)
@@ -1440,38 +1382,28 @@ local function moveTo(goalPos, speed, stopFn, touchPart)
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
 
-    local ok, tween = pcall(function()
-        return TweenService:Create(
+    local tween
+    local okCreate = pcall(function()
+        tween = TweenService:Create(
             root,
-            TweenInfo.new(
-                duration,
-                Enum.EasingStyle.Linear,
-                Enum.EasingDirection.Out,
-                0,
-                false,
-                0
-            ),
+            TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, 0, false, 0),
             { CFrame = goalCF }
         )
     end)
-    if not ok or not tween then
+    if not okCreate or not tween then
         Workspace.Gravity = originalGravity
         if root and root.Parent then root.Anchored = false end
-        if hum and hum.Parent and autoRotate ~= nil then
-            hum.AutoRotate = autoRotate
-        end
-        dbg("tween create failed:", tostring(tween))
+        if hum and hum.Parent and autoRotate ~= nil then hum.AutoRotate = autoRotate end
+        dbg("tween create failed")
         return false
     end
 
     local finished = false
     local completedConn = tween.Completed:Connect(function(state)
-        if state == Enum.PlaybackState.Completed then
-            finished = true
-        end
+        if state == Enum.PlaybackState.Completed then finished = true end
     end)
 
-    activeTween = tween
+    Motion.tween = tween
     tween:Play()
 
     local startedAt = tick()
@@ -1482,114 +1414,111 @@ local function moveTo(goalPos, speed, stopFn, touchPart)
     local earlyTouchDistance = math.max(tonumber(Config.EarlyTouchDistance) or 5, 1)
     local unanchoredEarly = false
     local lastTouchAt = 0
+    local voidHit = false
 
-    while not finished do
-        if not root.Parent then break end
-        if not instanceAlive() or LocalPlayer.Character ~= charAtStart then break end
-        if not Candy.Enabled or not roundActive or not isAlive() then break end
-        if activeTween ~= tween then break end
-        if stopFn and stopFn() then break end
-        if tick() > deadline then break end
+    local loopOk, loopErr = pcall(function()
+        while not finished do
+            if not root.Parent then break end
+            if not instanceAlive() or LocalPlayer.Character ~= charAtStart then break end
+            if not Candy.Enabled or not Round.active or not isAlive() then break end
+            if Motion.tween ~= tween then break end
+            if stopFn and stopFn() then break end
+            if tick() > deadline then break end
 
-        if Config.Noclip then applyNoclip() end
+            if Config.Noclip then Noclip.apply() end
 
-        local now = tick()
-        local pos = root.Position
-        local remaining = (goalPos - pos).Magnitude
-        local progress = 1 - remaining / math.max(initialDistance, 0.001)
-
-        if not unanchoredEarly and progress >= unanchorAt then
-            unanchoredEarly = true
-            if root.Anchored then root.Anchored = false end
-            dbg("early unanchor at", math.floor(math.clamp(progress, 0, 1) * 100) .. "%")
-        end
-
-        -- Keep the vertical lock only until the unanchor point. Once released,
-        -- never let the game or another script re-anchor the root mid-pickup.
-        if unanchoredEarly then
-            if root.Anchored then root.Anchored = false end
-        elseif not root.Anchored then
-            root.Anchored = true
-        end
-
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-
-        -- Fire touch interest during the unanchored final approach. The candy
-        -- can then register before the tween reaches its exact center, which
-        -- removes the old end-of-leg pickup pause.
-        if unanchoredEarly and touchPart and touchPart.Parent and now - lastTouchAt >= 0.05 then
-            local touchDist = (touchPart.Position - pos).Magnitude
-            if touchDist <= earlyTouchDistance then
-                lastTouchAt = now
-                fireTouch(root, touchPart)
+            local now = tick()
+            local pos = root.Position
+            local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+            if pos.Y <= destroyY + 60 then
+                voidHit = true
+                break
             end
+
+            local remaining = (goalPos - pos).Magnitude
+            local progress = 1 - remaining / math.max(initialDistance, 0.001)
+
+            if not unanchoredEarly and progress >= unanchorAt then
+                unanchoredEarly = true
+                if root.Anchored then root.Anchored = false end
+            end
+
+            if unanchoredEarly then
+                if root.Anchored then root.Anchored = false end
+            elseif not root.Anchored then
+                root.Anchored = true
+            end
+
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+
+            if unanchoredEarly and touchPart and touchPart.Parent
+                and now - lastTouchAt >= 0.05 then
+                local touchDist = (touchPart.Position - pos).Magnitude
+                if touchDist <= earlyTouchDistance then
+                    lastTouchAt = now
+                    fireTouch(root, touchPart)
+                end
+            end
+
+            if (pos - lastPos).Magnitude > 0.005 then
+                lastPos = pos
+                lastProgressAt = now
+            elseif now - lastProgressAt > 1.5 then
+                dbg("move stalled", initialDistance, "studs")
+                break
+            end
+
+            RunService.Heartbeat:Wait()
         end
+    end)
+    if not loopOk then dbg("move error:", tostring(loopErr)) end
 
-        if (pos - lastPos).Magnitude > 0.005 then
-            lastPos = pos
-            lastProgressAt = now
-        elseif now - lastProgressAt > 1.5 then
-            -- The tween says it is playing but the character is not actually
-            -- moving (game anchored/reset it). Fail fast so the picker can
-            -- choose another candy instead of hanging on this one.
-            dbg("move stalled", initialDistance, "studs")
-            break
-        end
-
-        RunService.Heartbeat:Wait()
-    end
-
-    if not finished then
-        pcall(function() tween:Cancel() end)
-    end
+    if not finished then pcall(function() tween:Cancel() end) end
     completedConn:Disconnect()
-    if activeTween == tween then
-        activeTween = nil
-    end
+    if Motion.tween == tween then Motion.tween = nil end
 
     Workspace.Gravity = originalGravity
 
     if root and root.Parent then
-        if finished then
-            -- Finish exactly at the requested world position; a near-enough
-            -- stop can leave the root outside a small collectible's touch box.
-            root.CFrame = goalCF
-        end
+        if finished then root.CFrame = goalCF end
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
-        -- Hand the character back to physics before the pickup finisher.
         root.Anchored = false
     end
+    if hum and hum.Parent and autoRotate ~= nil then hum.AutoRotate = autoRotate end
 
-    if hum and hum.Parent and autoRotate ~= nil then
-        hum.AutoRotate = autoRotate
+    if voidHit then
+        Hide.recover("move fell into the void")
+        return false
     end
     return finished
 end
 
-local function collectCandy(target)
-    if not target or not isAvailable(target.obj) then return false, "gone" end
+function Move.collect(target, id)
+    if not target or not Scan.available(target.obj) then return false, "gone" end
+    if Motion.busy() then return false, "busy" end
     local root = getRoot()
     if not root then return false, "dead" end
 
     local obj = target.obj
-    Candy.Busy   = true
+    Candy.Busy = true
     Candy.Target = target
 
-    local stopFn = function()
-        if not Candy.Enabled or not roundActive or not isAlive() then return true end
-        if pollWaitingForTurn() then return true end
-        if not isAvailable(obj) then return true end
-        if not candyIsSafe(obj) then return true end
+    local function stopFn()
+        if not instanceAlive() or not Candy.Enabled or not Round.active or not isAlive() then
+            return true
+        end
+        if id and Candy.ActiveWorker ~= id then return true end
+        if WaitTurn.poll() then return true end
+        if not Scan.available(obj) then return true end
+        if not Scan.safe(obj) then return true end
         return false
     end
 
-    local reached = moveTo(obj.Position, Candy.TweenSpeed, stopFn, obj)
+    local reached = Move.to(obj.Position, Candy.TweenSpeed, stopFn, obj)
 
-    -- Reliable pickup finisher: keep the unanchored root centered on the
-    -- collectible briefly, with gravity temporarily disabled so it doesn't drift.
-    if reached and Candy.Enabled and roundActive and isAlive() and isAvailable(obj) then
+    if reached and Candy.Enabled and Round.active and isAlive() and Scan.available(obj) then
         local r = getRoot()
         if r and obj and obj.Parent then
             local previousGravity = Workspace.Gravity
@@ -1602,18 +1531,15 @@ local function collectCandy(target)
                 local finishTime = math.clamp(tonumber(Config.PickupFinishTime) or 0.12, 0.02, 0.5)
                 local touchUntil = tick() + finishTime
                 repeat
-                    if not Candy.Enabled or not roundActive or not isAlive() then break end
-                    if not obj.Parent or not isAvailable(obj) then break end
-
-                    -- Re-read Position in case the collectible moved between frames.
+                    if not Candy.Enabled or not Round.active or not isAlive() then break end
+                    if not obj.Parent or not Scan.available(obj) then break end
                     r.CFrame = CFrame.new(obj.Position) * r.CFrame.Rotation
                     r.AssemblyLinearVelocity = Vector3.zero
                     r.AssemblyAngularVelocity = Vector3.zero
                     fireTouch(r, obj)
                     RunService.Heartbeat:Wait()
                 until tick() >= touchUntil
-
-                touchOk = not isAvailable(obj)
+                touchOk = not Scan.available(obj)
             end)
 
             if r and r.Parent then
@@ -1622,22 +1548,22 @@ local function collectCandy(target)
             end
             Workspace.Gravity = previousGravity
             if not ok then dbg("pickup touch error:", tostring(err)) end
-            if not touchOk and isAvailable(obj) then
+            if not touchOk and Scan.available(obj) then
                 fireTouch(r, obj)
                 task.wait(0.05)
             end
         end
     end
 
-    local got = not isAvailable(obj)
-    Candy.Busy   = false
+    local got = not Scan.available(obj)
+    Candy.Busy = false
     Candy.Target = nil
 
     if got then
         Candy.Picked = Candy.Picked + 1
         Candy.SkipUntil[obj] = nil
         Candy.Failures[obj] = nil
-        local guiCount = refreshCollectedFromGui()
+        local guiCount = Bag.refresh()
         if not guiCount then
             Candy.Collected = math.max(Candy.Picked, Candy.ServerCount)
         end
@@ -1645,60 +1571,22 @@ local function collectCandy(target)
         return true, "collected"
     end
 
-    -- Tell the caller why the attempt ended. Only a genuine movement failure
-    -- gets a failure penalty; waiting/danger/round-end must not blacklist a
-    -- perfectly good candy.
     if not Candy.Enabled then return false, "disabled" end
-    if not roundActive then return false, "roundEnded" end
+    if not Round.active then return false, "roundEnded" end
     if not isAlive() then return false, "dead" end
     if not obj.Parent then return false, "gone" end
-    if not isAvailable(obj) then return true, "collected" end
-    if pollWaitingForTurn() then return false, "waiting" end
-    if not candyIsSafe(obj) then return false, "danger" end
+    if not Scan.available(obj) then return true, "collected" end
+    if WaitTurn.poll() then return false, "waiting" end
+    if not Scan.safe(obj) then return false, "danger" end
     return false, "unreachable"
 end
 
--- ==================== GUN / ROLE COMBAT ====================
-local function hasKnife(player)
-    player = player or LocalPlayer
-    local char = player.Character
-    if char and char:FindFirstChild("Knife") then return true end
-    local backpack = player:FindFirstChild("Backpack")
-    if not backpack and char then
-        backpack = char:FindFirstChildOfClass("Backpack")
-    end
-    return backpack ~= nil and backpack:FindFirstChild("Knife") ~= nil
-end
-
-local function findKiller()
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and roleOf(player) == "Murderer" and not isDead(player) then
-            return player
-        end
-    end
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and hasKnife(player) and not isDead(player) then
-            return player
-        end
-    end
-    return nil
-end
-
-local function getSheriff()
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and roleOf(player) == "Sheriff" and not isDead(player) then
-            return player
-        end
-    end
-    return nil
-end
-
-local function findGunTool()
+-- ==================== GUN ====================
+local Gun = {}
+function Gun.findTool()
     local char = LocalPlayer.Character
     local backpack = LocalPlayer:FindFirstChild("Backpack")
-    if not backpack and char then
-        backpack = char:FindFirstChildOfClass("Backpack")
-    end
+    if not backpack and char then backpack = char:FindFirstChildOfClass("Backpack") end
     local function scan(container)
         if not container then return nil end
         for _, child in ipairs(container:GetChildren()) do
@@ -1710,15 +1598,10 @@ local function findGunTool()
     end
     return scan(char) or scan(backpack)
 end
-
-local function playerHasGun()
-    return findGunTool() ~= nil
+function Gun.has()
+    return Gun.findTool() ~= nil
 end
-
--- Any other player holding a gun (sheriff, or an innocent who picked one up).
--- Used as a fallback when role data is missing or stale, so combat still knows
--- who to fling for a gun drop.
-local function playerHasGunTool(player)
+function Gun.hasOn(player)
     local char = player.Character
     if char and char:FindFirstChild("Gun") then return true end
     local containers = {}
@@ -1726,7 +1609,6 @@ local function playerHasGunTool(player)
     local backpack = player:FindFirstChild("Backpack")
     if not backpack and char then backpack = char:FindFirstChildOfClass("Backpack") end
     if backpack then table.insert(containers, backpack) end
-
     for _, container in ipairs(containers) do
         for _, child in ipairs(container:GetChildren()) do
             if child:IsA("Tool") and child.Name:lower():find("gun") then
@@ -1736,20 +1618,27 @@ local function playerHasGunTool(player)
     end
     return false
 end
-
-local function findGunHolder()
+function Gun.holder()
     for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and not isDead(player) and playerHasGunTool(player) then
+        if player ~= LocalPlayer and not Round.isDead(player) and Gun.hasOn(player) then
             return player
         end
     end
     return nil
 end
-
-local function equipGun()
+function Gun.sheriff()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and Round.roleOf(player) == "Sheriff"
+            and not Round.isDead(player) then
+            return player
+        end
+    end
+    return nil
+end
+function Gun.equip()
     local char = LocalPlayer.Character
     if not char then return nil end
-    local gun = findGunTool()
+    local gun = Gun.findTool()
     if not gun then return nil end
     if gun.Parent == char then return gun end
     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -1758,13 +1647,12 @@ local function equipGun()
     local t0 = tick()
     repeat
         task.wait(0.05)
-        gun = findGunTool()
+        gun = Gun.findTool()
     until (gun and gun.Parent == char) or tick() - t0 > 1.5
     if gun and gun.Parent == char then return gun end
     return nil
 end
-
-local function getShootRemote(gun)
+function Gun.shootRemote(gun)
     if not gun then return nil end
     local shoot = gun:FindFirstChild("Shoot")
     if shoot and shoot:IsA("RemoteEvent") then return shoot end
@@ -1775,32 +1663,30 @@ local function getShootRemote(gun)
     end
     return nil
 end
-
-local function getAimPosition(killer)
+function Gun.aim(killer)
     local char = killer and killer.Character
     if not char then return nil end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local head = char:FindFirstChild("Head")
-    local part = head or hrp
-    if not part then return nil end
-    -- Direct aim only: no velocity prediction, so the shot goes exactly at the
-    -- murderer's current position while we are synced right behind him.
-    return part.Position
+    local part = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+    return part and part.Position or nil
 end
-
-local function fireAt(killer, gun, immediate)
-    gun = gun or equipGun()
+function Gun.down(killer)
+    if not killer or not killer.Parent then return true end
+    local char = killer.Character
+    if not char then return true end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum == nil or hum.Health <= 0
+end
+function Gun.fire(killer, gun, immediate)
+    gun = gun or Gun.equip()
     if not gun then return false end
-    local remote = getShootRemote(gun)
+    local remote = Gun.shootRemote(gun)
     if not remote then
         warn("[shoot] gun has no Shoot remote")
         return false
     end
-
     local root = getRoot()
     if not root then return false end
-
-    local aim = getAimPosition(killer)
+    local aim = Gun.aim(killer)
     if not aim then return false end
 
     local attachment = root:FindFirstChild("GunRaycastAttachment")
@@ -1811,7 +1697,8 @@ local function fireAt(killer, gun, immediate)
             attachment = root:FindFirstChild("GunRaycastAttachment")
         until attachment or tick() - t0 > 0.6
     end
-    local origin = attachment and attachment.WorldCFrame or CFrame.new(root.Position + Vector3.new(0, 1, 0))
+    local origin = attachment and attachment.WorldCFrame
+        or CFrame.new(root.Position + Vector3.new(0, 1, 0))
 
     local ok, err = pcall(function()
         remote:FireServer(origin, CFrame.new(aim))
@@ -1822,22 +1709,10 @@ local function fireAt(killer, gun, immediate)
     end
     return true
 end
-
-local function killerDown(killer)
-    if not killer or not killer.Parent then return true end
-    local char = killer.Character
-    if not char then return true end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    return hum == nil or hum.Health <= 0
-end
-
-local function behindKillerCF(killer)
+function Gun.behindCF(killer)
     local char = killer and killer.Character
     local killerRoot = char and char:FindFirstChild("HumanoidRootPart")
     if not killerRoot then return nil end
-
-    -- Use a flattened look vector so a murderer looking up/down does not drag
-    -- the sync point above or below him.
     local look = killerRoot.CFrame.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
     if flat.Magnitude < 0.001 then
@@ -1845,39 +1720,37 @@ local function behindKillerCF(killer)
     else
         flat = flat.Unit
     end
-
     local distance = tonumber(Config.SyncBehindDistance) or 3
     local height = tonumber(Config.SyncBehindHeight) or 1
     local behind = killerRoot.Position - flat * distance + Vector3.new(0, height, 0)
     return CFrame.new(behind, killerRoot.Position)
 end
 
-local function syncBehindKiller(killer, root, physicsTarget)
-    local cf = behindKillerCF(killer)
+local function syncBehind(killer, root, physicsTarget)
+    local cf = Gun.behindCF(killer)
     if not cf then return false end
     if root.Anchored then root.Anchored = false end
     root.CFrame = cf
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
-    if physicsTarget then
-        -- Same technique as the fling loop: reapply the hidden physics
-        -- representation every step. Setting it once is not enough because the
-        -- server can still be using the pre-sync position when the shot lands.
-        setPhysicsRep(root, physicsTarget)
-    end
+    if physicsTarget then Phys.set(root, physicsTarget) end
     return true
 end
 
-local function teleportShoot(silent)
-    if isShooting or isTeleporting then return false, false end
-    if tick() - lastTeleportShot < Config.TeleportShootCooldown then return false, false end
+-- Synced volley behind the murderer. Guarded so a second combat caller, a
+-- fling, or a gun teleport can never fight it for the root.
+function Gun.shoot(silent)
+    if Motion.shooting or Motion.teleporting or Fling.enabled or Revenge.active then
+        return false, false
+    end
+    if tick() - Motion.lastShot < Config.TeleportShootCooldown then return false, false end
     if not instanceAlive() or not isAlive() then return false, false end
-    if not playerHasGun() then
+    if not Gun.has() then
         if not silent then print("[candy] no gun") end
         return false, false
     end
 
-    local killer = findKiller()
+    local killer = Killer.find()
     if not killer or not killer.Character then
         if not silent then print("[candy] no murderer") end
         return false, false
@@ -1887,18 +1760,14 @@ local function teleportShoot(silent)
     local killerRoot = killer.Character:FindFirstChild("HumanoidRootPart")
     if not root or not killerRoot then return false, false end
 
-    -- Claim the shooting slot before any yielding call. equipGun can wait up
-    -- to 1.5s; without this, two combat loops could both pass the guard and
-    -- then fight over the same root (which is what stacked teleports).
-    isShooting = true
-    lastTeleportShot = tick()
+    Motion.shooting = true
+    Motion.lastShot = tick()
+    Motion.cancelTween()
+    if Hide.active then Hide.unhide() end
 
-    cancelTween()
-    if hidden then unhideCharacter() end
-
-    local gun = equipGun()
+    local gun = Gun.equip()
     if not gun then
-        isShooting = false
+        Motion.shooting = false
         return false, false
     end
 
@@ -1910,7 +1779,7 @@ local function teleportShoot(silent)
     local saved = {}
     local char = LocalPlayer.Character
     if not char then
-        isShooting = false
+        Motion.shooting = false
         return false, false
     end
     for _, part in ipairs(char:GetDescendants()) do
@@ -1935,8 +1804,6 @@ local function teleportShoot(silent)
         local shots = math.clamp(tonumber(Config.SyncVolleyShots) or 4, 1, 20)
         local interval = math.clamp(tonumber(Config.SyncShotInterval) or 0.08, 0.02, 0.5)
 
-        -- Warm up the raycast attachment before the hold. Waiting for it at the
-        -- midpoint would interrupt the sync loop and send the shot late.
         local attachment = root:FindFirstChild("GunRaycastAttachment")
         if not attachment then
             local warmup = tick()
@@ -1946,36 +1813,29 @@ local function teleportShoot(silent)
             until attachment or tick() - warmup > 0.4
         end
 
-        -- Initial sync, then hold the hidden server representation behind him
-        -- for the whole window. The first shot is deliberately delayed until
-        -- the middle of that window.
-        if not syncBehindKiller(killer, root, killerHead) then return end
+        if not syncBehind(killer, root, killerHead) then return end
         local started = tick()
         local shotsFired = 0
         local lastShotAt = -math.huge
 
         while true do
-            if not instanceAlive() or not Candy.Enabled or not roundActive or not isAlive() then break end
+            if not instanceAlive() or not Candy.Enabled or not Round.active or not isAlive() then break end
 
-            local down = killerDown(killer)
+            local down = Gun.down(killer)
             if down then hit = true end
-
-            if not syncBehindKiller(killer, root, killerHead) then break end
+            if not syncBehind(killer, root, killerHead) then break end
 
             local now = tick()
             local elapsed = now - started
             if not down and shotsFired < shots and elapsed >= fireAtTime
                 and (shotsFired == 0 or now - lastShotAt >= interval) then
-                -- One extra network step with the behind CFrame (and the hidden
-                -- physics rep) after the midpoint has been reached.
                 RunService.Heartbeat:Wait()
-                if not instanceAlive() or not Candy.Enabled or not roundActive or not isAlive() then break end
-
-                if killerDown(killer) then
+                if not instanceAlive() or not Candy.Enabled or not Round.active or not isAlive() then break end
+                if Gun.down(killer) then
                     hit = true
                 else
-                    if not syncBehindKiller(killer, root, killerHead) then break end
-                    if fireAt(killer, gun, true) then firedAny = true end
+                    if not syncBehind(killer, root, killerHead) then break end
+                    if Gun.fire(killer, gun, true) then firedAny = true end
                     shotsFired = shotsFired + 1
                     lastShotAt = tick()
                 end
@@ -1985,30 +1845,28 @@ local function teleportShoot(silent)
             RunService.Heartbeat:Wait()
         end
 
-        if killerDown(killer) then hit = true end
+        if Gun.down(killer) then hit = true end
     end)
     if not ok then warn("[teleportShoot] " .. tostring(err)) end
 
-    if instanceAlive() and root.Parent and LocalPlayer.Character == char then
+    -- Only restore a living body. After a death the corpse must not be moved.
+    if instanceAlive() and isAlive() and root.Parent and LocalPlayer.Character == char then
         root.CFrame = originalCF
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     end
-    clearPhysicsRep(root)
+    Phys.clear(root)
     for part, coll in pairs(saved) do
         if part and part.Parent then part.CanCollide = coll end
     end
-    if hum and hum.Parent and autoRotate ~= nil then
-        hum.AutoRotate = autoRotate
-    end
+    if hum and hum.Parent and autoRotate ~= nil then hum.AutoRotate = autoRotate end
 
-    isShooting = false
+    Motion.shooting = false
     dbg("teleportShoot hit=", tostring(hit), "fired=", tostring(firedAny))
     return hit, firedAny
 end
 
--- ==================== DROPPED GUN PICKUP ====================
-local function isDroppedGun(obj)
+function Gun.isDrop(obj)
     if obj:IsA("BasePart") and obj.Name == "GunDrop" then return true end
     if obj:IsA("Tool") and obj.Name:lower():find("gun") then
         local p = obj.Parent
@@ -2019,23 +1877,21 @@ local function isDroppedGun(obj)
     end
     return false
 end
-
-local function gunPos(obj)
+function Gun.dropPos(obj)
     if obj:IsA("BasePart") then return obj.Position end
     local handle = obj:FindFirstChild("Handle")
     if handle and handle:IsA("BasePart") then return handle.Position end
     local any = obj:FindFirstChildWhichIsA("BasePart")
     return any and any.Position or nil
 end
-
-local function findNearestGun(anyDistance)
+function Gun.nearestDrop(anyDistance)
     local root = getRoot()
     if not root then return nil end
     local nearest, best = nil, math.huge
 
     local function consider(obj)
-        if not isDroppedGun(obj) then return end
-        local pos = gunPos(obj)
+        if not Gun.isDrop(obj) then return end
+        local pos = Gun.dropPos(obj)
         if not pos then return end
         local d = (pos - root.Position).Magnitude
         if d < best then
@@ -2054,37 +1910,44 @@ local function findNearestGun(anyDistance)
     end
     scan(Workspace, 3)
 
-    if nearest and (anyDistance or nearest.dist <= GUN_DISTANCE) then return nearest end
+    if nearest and (anyDistance or nearest.dist <= Config.GunDistance) then
+        return nearest
+    end
     return nil
 end
-
-local function waitForGun(timeout)
+function Gun.waitFor(timeout)
     local t0 = tick()
     while tick() - t0 < (timeout or 2) do
-        if playerHasGun() then return true end
+        if Gun.has() then return true end
         task.wait(0.1)
     end
-    return playerHasGun()
+    return Gun.has()
 end
-
-local function waitForGunDrop(timeout)
+function Gun.waitForDrop(timeout)
     local t0 = tick()
     while tick() - t0 < (timeout or 5) do
-        if not Candy.Enabled or not roundActive or not isAlive() then return false end
-        if findNearestGun(true) then return true end
+        if not Candy.Enabled or not Round.active or not isAlive() then return false end
+        if Gun.nearestDrop(true) then return true end
         task.wait(0.2)
     end
     return false
 end
-
-local function teleportToGun(silent)
-    if isTeleporting or isShooting then return false end
+function Gun.toDrop(silent)
+    if Motion.teleporting or Motion.shooting or Fling.enabled or Revenge.active then
+        return false
+    end
     if not instanceAlive() then return false end
-    if playerHasGun() then return true end
+    if Gun.has() then return true end
+    if Hide.active then Hide.unhide() end
 
-    local info = findNearestGun(true)
+    local info = Gun.nearestDrop(true)
     if not info then
         if not silent then print("[candy] no dropped gun") end
+        return false
+    end
+    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+    if info.pos.Y <= destroyY + 60 then
+        dbg("dropped gun is in the void; skipping")
         return false
     end
 
@@ -2096,59 +1959,60 @@ local function teleportToGun(silent)
     if info.obj:IsA("BasePart") then
         handle = info.obj
     else
-        handle = info.obj:FindFirstChild("Handle") or info.obj:FindFirstChildWhichIsA("BasePart")
+        handle = info.obj:FindFirstChild("Handle")
+            or info.obj:FindFirstChildWhichIsA("BasePart")
     end
 
-    isTeleporting = true
-    cancelTween()
+    Motion.teleporting = true
+    Motion.cancelTween()
     local originalCF = root.CFrame
 
-    -- Try the remote touch first; if that does not take, teleport straight onto
-    -- the gun and keep re-touching it. The character has noclip, so jumping any
-    -- distance to the drop is safe and much faster than running to it.
-    fireTouch(root, handle)
-    task.wait(0.15)
+    local ok, result = pcall(function()
+        fireTouch(root, handle)
+        task.wait(0.15)
 
-    if not playerHasGun() then
-        local t0 = tick()
-        while tick() - t0 < 1.2 and not playerHasGun() do
-            if not instanceAlive() or LocalPlayer.Character ~= charAtStart
-                or not Candy.Enabled or not roundActive or not isAlive() then break end
+        if not Gun.has() then
+            local t0 = tick()
+            while tick() - t0 < 1.2 and not Gun.has() do
+                if not instanceAlive() or LocalPlayer.Character ~= charAtStart
+                    or not Candy.Enabled or not Round.active or not isAlive() then break end
 
-            -- Re-scan so a gun that is still falling is tracked to its new spot.
-            local fresh = findNearestGun(true)
-            local pos = fresh and fresh.pos or info.pos
-            local h = handle
-            if fresh and fresh.obj ~= info.obj then
-                if fresh.obj:IsA("BasePart") then
-                    h = fresh.obj
-                else
-                    h = fresh.obj:FindFirstChild("Handle")
-                        or fresh.obj:FindFirstChildWhichIsA("BasePart")
+                local fresh = Gun.nearestDrop(true)
+                local pos = fresh and fresh.pos or info.pos
+                local h = handle
+                if fresh and fresh.obj ~= info.obj then
+                    if fresh.obj:IsA("BasePart") then
+                        h = fresh.obj
+                    else
+                        h = fresh.obj:FindFirstChild("Handle")
+                            or fresh.obj:FindFirstChildWhichIsA("BasePart")
+                    end
                 end
-            end
 
-            local rr = getRoot()
-            if rr then
-                rr.CFrame = CFrame.new(pos + Vector3.new(0, 1.5, 0))
-                rr.AssemblyLinearVelocity = Vector3.zero
-                rr.AssemblyAngularVelocity = Vector3.zero
-                if h then fireTouch(rr, h) end
+                local rr = getRoot()
+                if rr then
+                    rr.CFrame = CFrame.new(pos + Vector3.new(0, 1.5, 0))
+                    rr.AssemblyLinearVelocity = Vector3.zero
+                    rr.AssemblyAngularVelocity = Vector3.zero
+                    if h then fireTouch(rr, h) end
+                end
+                task.wait(0.05)
             end
-            task.wait(0.05)
         end
-    end
+        return Gun.has()
+    end)
 
-    isTeleporting = false
-    local got = playerHasGun()
+    Motion.teleporting = false
+    local got = ok and result == true
 
     if not got then
         local r = getRoot()
-        if r and instanceAlive() and LocalPlayer.Character == charAtStart then
+        if r and instanceAlive() and isAlive()
+            and LocalPlayer.Character == charAtStart then
             r.CFrame = originalCF
         end
     else
-        equipGun()
+        Gun.equip()
     end
 
     dbg("teleportToGun got=", tostring(got))
@@ -2156,131 +2020,125 @@ local function teleportToGun(silent)
 end
 
 -- ==================== FLING ====================
-local FlingEnabled = false
-local flingLoop, flingSpinLoop
-local flingTarget, flingOriginalCF, flingStartPos, flingChar
-local flingBodySaved = {}
-
-local function setFlingBody(enabled)
+Fling.bodySaved = {}
+function Fling.setBody(enabled)
     local char = LocalPlayer.Character
     if not char then return end
     if enabled then
         for _, part in ipairs(char:GetDescendants()) do
-            if part:IsA("BasePart") and flingBodySaved[part] == nil then
-                flingBodySaved[part] = { CanCollide = part.CanCollide, Massless = part.Massless }
+            if part:IsA("BasePart") and Fling.bodySaved[part] == nil then
+                Fling.bodySaved[part] = { CanCollide = part.CanCollide, Massless = part.Massless }
                 part.CanCollide = false
                 part.Massless = true
             end
         end
     else
-        for part, state in pairs(flingBodySaved) do
+        for part, state in pairs(Fling.bodySaved) do
             if part and part.Parent then
                 part.CanCollide = state.CanCollide
                 part.Massless = state.Massless
             end
         end
-        table.clear(flingBodySaved)
+        table.clear(Fling.bodySaved)
     end
 end
-
-local function stopFling()
-    if flingLoop then flingLoop:Disconnect(); flingLoop = nil end
-    if flingSpinLoop then flingSpinLoop:Disconnect(); flingSpinLoop = nil end
+function Fling.stop()
+    if Fling.loop then Fling.loop:Disconnect(); Fling.loop = nil end
+    if Fling.spin then Fling.spin:Disconnect(); Fling.spin = nil end
 
     local root = getRoot()
     if root then
         root.AssemblyAngularVelocity = Vector3.zero
         root.AssemblyLinearVelocity = Vector3.zero
-        if flingOriginalCF and LocalPlayer.Character == flingChar then
-            root.CFrame = flingOriginalCF
+        if Fling.originalCF and LocalPlayer.Character == Fling.char then
+            root.CFrame = Fling.originalCF
         end
-        clearPhysicsRep(root)
+        Phys.clear(root)
     end
 
-    setFlingBody(false)
+    Fling.setBody(false)
     local hum = getHumanoid()
     if hum then
         hum.PlatformStand = false
         hum.AutoRotate = true
     end
 
-    flingTarget = nil
-    flingOriginalCF = nil
-    flingStartPos = nil
-    flingChar = nil
-    FlingEnabled = false
+    Fling.target = nil
+    Fling.originalCF = nil
+    Fling.char = nil
+    Fling.enabled = false
 end
-
-local function startFling(target)
-    if isShooting or isTeleporting then return false end
+function Fling.start(target)
+    if Motion.shooting or Motion.teleporting then return false end
     if not instanceAlive() then return false end
     if not target or not target.Character then return false end
     local root = getRoot()
     local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
     if not root or not targetRoot then return false end
 
-    if FlingEnabled then stopFling() end
-    flingTarget = target
-    flingStartPos = targetRoot.Position
-    flingOriginalCF = root.CFrame
-    flingChar = LocalPlayer.Character
-    FlingEnabled = true
-    setFlingBody(true)
+    if Fling.enabled then Fling.stop() end
+    if Hide.active then Hide.unhide() end
+    Motion.cancelTween()
 
-    flingLoop = RunService.Heartbeat:Connect(function()
-        if not FlingEnabled or not instanceAlive() or not Candy.Enabled or not roundActive
-            or isShooting or isTeleporting then
-            stopFling()
+    Fling.target = target
+    Fling.originalCF = root.CFrame
+    Fling.char = LocalPlayer.Character
+    Fling.enabled = true
+    Fling.setBody(true)
+
+    Fling.loop = RunService.Heartbeat:Connect(function()
+        if not Fling.enabled or not instanceAlive() or not Candy.Enabled or not Round.active
+            or Motion.shooting or Motion.teleporting then
+            Fling.stop()
             return
         end
         local myRoot = getRoot()
-        if not myRoot or LocalPlayer.Character ~= flingChar then stopFling(); return end
-        if not flingTarget or not flingTarget.Character then stopFling(); return end
+        if not myRoot or LocalPlayer.Character ~= Fling.char then Fling.stop(); return end
+        if not Fling.target or not Fling.target.Character then Fling.stop(); return end
 
-        local targetChar = flingTarget.Character
+        local targetChar = Fling.target.Character
         local tr = targetChar:FindFirstChild("HumanoidRootPart")
         local th = targetChar:FindFirstChild("Head")
         local hum = targetChar:FindFirstChildOfClass("Humanoid")
-        if not tr or not hum or hum.Health <= 0 then stopFling(); return end
+        if not tr or not hum or hum.Health <= 0 then Fling.stop(); return end
 
         myRoot.CFrame = tr.CFrame
-        if th then setPhysicsRep(myRoot, th) end
+        if th then Phys.set(myRoot, th) end
     end)
 
-    flingSpinLoop = RunService.Heartbeat:Connect(function()
-        if not FlingEnabled or not instanceAlive() then return end
+    Fling.spin = RunService.Heartbeat:Connect(function()
+        if not Fling.enabled or not instanceAlive() then return end
         local myRoot = getRoot()
-        if not myRoot or LocalPlayer.Character ~= flingChar then
-            stopFling()
+        if not myRoot or LocalPlayer.Character ~= Fling.char then
+            Fling.stop()
             return
         end
         myRoot.AssemblyAngularVelocity = Vector3.new(0, 99999, 0)
         task.wait(0.15)
-        if not FlingEnabled then return end
+        if not Fling.enabled then return end
         myRoot.AssemblyAngularVelocity = Vector3.zero
         task.wait(0.08)
     end)
 
     return true
 end
-
-local function flingPlayer(target, timeout)
+function Fling.player(target, timeout)
     if not target or not target.Character then return false end
-    if FlingEnabled then stopFling() end
+    if Fling.enabled then Fling.stop() end
 
     local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
     if not targetRoot then return false end
     local startPos = targetRoot.Position
     local myChar = LocalPlayer.Character
 
-    if not startFling(target) then return false end
+    if not Fling.start(target) then return false end
 
     local t0 = tick()
     local displaced = false
     while tick() - t0 < (timeout or 2) do
         task.wait(0.05)
         if not instanceAlive() or LocalPlayer.Character ~= myChar
-            or not Candy.Enabled or not roundActive or not isAlive() then break end
+            or not Candy.Enabled or not Round.active or not isAlive() then break end
         local char = target.Character
         local tr = char and char:FindFirstChild("HumanoidRootPart")
         if not tr then displaced = true; break end
@@ -2292,85 +2150,60 @@ local function flingPlayer(target, timeout)
         end
     end
 
-    stopFling()
+    Fling.stop()
     return displaced
 end
 
 -- ==================== WAITING FOR YOUR TURN ====================
--- Verified in the running game: this message is not a TextLabel. It is the
--- ImageLabel MainGUI.Game.Waiting, shown with image asset 189761558 while the
--- player waits in the lobby. Asset 304416585 is the map-loading image and must
--- not count as "waiting for your turn".
-local WAITING_IMAGE_ID = "189761558"
-
-local Waiting = {
-    Active      = false,
-    Handled     = false,
-    LastCheck   = 0,
-    LastAttempt = 0,
-    ClearedAt   = 0,
-}
-
-local function findWaitingOverlay()
+function WaitTurn.findOverlay()
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     local main = pg and pg:FindFirstChild("MainGUI")
     local gameGui = main and main:FindFirstChild("Game")
     local overlay = gameGui and gameGui:FindFirstChild("Waiting")
-    if overlay and overlay:IsA("ImageLabel") then
-        return overlay
-    end
+    if overlay and overlay:IsA("ImageLabel") then return overlay end
     return nil
 end
-
-local function isWaitingTextVisible()
-    local overlay = findWaitingOverlay()
+function WaitTurn.visible()
+    local overlay = WaitTurn.findOverlay()
     if not overlay or not overlay.Visible then return false end
-
     local node = overlay.Parent
     while node do
         if node:IsA("GuiObject") and not node.Visible then return false end
         if node:IsA("LayerCollector") and not node.Enabled then return false end
         node = node.Parent
     end
-
     local image = tostring(overlay.Image or "")
-    return image:find(WAITING_IMAGE_ID, 1, true) ~= nil
+    return image:find(WaitTurn.imageId, 1, true) ~= nil
 end
-
-pollWaitingForTurn = function()
+function WaitTurn.poll()
     local now = tick()
-    if now - Waiting.LastCheck < 0.12 then
-        return Waiting.Active
-    end
-    Waiting.LastCheck = now
+    if now - WaitTurn.lastCheck < 0.12 then return WaitTurn.active end
+    WaitTurn.lastCheck = now
 
-    local visible = isWaitingTextVisible()
+    local visible = WaitTurn.visible()
     if visible then
-        if not Waiting.Active then
-            if Waiting.ClearedAt == 0 or now - Waiting.ClearedAt >= 0.5 then
-                -- New waiting period: allow one fresh fling.
-                Waiting.Handled = false
-                Waiting.LastAttempt = 0
+        if not WaitTurn.active then
+            if WaitTurn.clearedAt == 0 or now - WaitTurn.clearedAt >= 0.5 then
+                WaitTurn.handled = false
+                WaitTurn.lastAttempt = 0
             end
             dbg("WAITING FOR YOUR TURN detected")
         end
-        Waiting.Active = true
-        Waiting.ClearedAt = 0
-    elseif Waiting.Active then
-        Waiting.Active = false
-        Waiting.ClearedAt = now
+        WaitTurn.active = true
+        WaitTurn.clearedAt = 0
+    elseif WaitTurn.active then
+        WaitTurn.active = false
+        WaitTurn.clearedAt = now
         dbg("WAITING FOR YOUR TURN cleared")
     end
-    return Waiting.Active
+    return WaitTurn.active
 end
-
-local function flingMurdererForWaiting()
-    if not Candy.Enabled or not roundActive or not isAlive() then return false end
-    local killer = findKiller() or findMurdererPlayer()
+function WaitTurn.flingMurderer()
+    if not Candy.Enabled or not Round.active or not isAlive() then return false end
+    local killer = Killer.find()
     if not killer or not killer.Character then return false end
-
-    unhideCharacter()
-    local ok, displaced = pcall(flingPlayer, killer, 2.0)
+    Hide.unhide()
+    local ok, displaced = pcall(Fling.player, killer, 2.0)
     if not ok then
         warn("[waiting] fling failed: " .. tostring(displaced))
         return false
@@ -2378,33 +2211,30 @@ local function flingMurdererForWaiting()
     dbg("waiting fling", killer.Name, "displaced=", tostring(displaced))
     return displaced == true
 end
-
-handleWaitingForTurn = function()
-    if not Waiting.Handled and tick() - Waiting.LastAttempt >= 2.5 then
-        Waiting.LastAttempt = tick()
-        if flingMurdererForWaiting() then
-            Waiting.Handled = true
+function WaitTurn.handle()
+    if not WaitTurn.handled and tick() - WaitTurn.lastAttempt >= 2.5 then
+        WaitTurn.lastAttempt = tick()
+        if WaitTurn.flingMurderer() then
+            WaitTurn.handled = true
         end
     end
-
-    cancelTween()
+    Motion.cancelTween()
     Candy.Busy = false
     Candy.Target = nil
     if Candy.Enabled and Config.HideUnderMap and isAlive() and not Candy.Hidden then
-        hideCharacter()
+        Hide.hide()
     end
 end
 
 -- ==================== KNIFE SWEEP ====================
-local hitboxSaved = {}
-
-local function setHitbox(player, size)
+local Knife = { saved = {} }
+function Knife.set(player, size)
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
 
-    if not hitboxSaved[player] then
-        hitboxSaved[player] = {
+    if not Knife.saved[player] then
+        Knife.saved[player] = {
             Size = hrp.Size,
             Transparency = hrp.Transparency,
             CanCollide = hrp.CanCollide,
@@ -2416,24 +2246,22 @@ local function setHitbox(player, size)
         hrp.Transparency = 0.7
         hrp.CanCollide = false
     else
-        local old = hitboxSaved[player]
+        local old = Knife.saved[player]
         if old then
             hrp.Size = old.Size
             hrp.Transparency = old.Transparency
             hrp.CanCollide = old.CanCollide
         end
-        hitboxSaved[player] = nil
+        Knife.saved[player] = nil
     end
 end
-
-local function restoreHitboxes()
-    for player in pairs(hitboxSaved) do
-        if player.Parent then setHitbox(player, nil) end
+function Knife.restore()
+    for player in pairs(Knife.saved) do
+        if player.Parent then Knife.set(player, nil) end
     end
-    table.clear(hitboxSaved)
+    table.clear(Knife.saved)
 end
-
-local function getKnife()
+function Knife.get()
     local char = LocalPlayer.Character
     if not char then return nil end
     local knife = char:FindFirstChild("Knife")
@@ -2453,36 +2281,32 @@ local function getKnife()
     end
     return knife
 end
-
-local function knifeSweep()
+function Knife.sweep()
     if not isAlive() then return 0 end
-    if myRole() ~= "Murderer" and not hasKnife(LocalPlayer) then return 0 end
+    if Round.myRole() ~= "Murderer" and not Killer.hasKnife(LocalPlayer) then return 0 end
 
-    local knife = getKnife()
+    local knife = Knife.get()
     if not knife then
         local t0 = tick()
         while tick() - t0 < 2 and not knife do
             task.wait(0.15)
-            knife = getKnife()
+            knife = Knife.get()
         end
     end
     if not knife then return 0 end
 
     local events = knife:FindFirstChild("Events")
-    local touched = events and events:FindFirstChild(KNIFE_EVENT)
+    local touched = events and events:FindFirstChild(Config.KnifeEvent)
     if not touched or not touched:IsA("RemoteEvent") then
-        warn("[knife] " .. KNIFE_EVENT .. " missing")
+        warn("[knife] " .. Config.KnifeEvent .. " missing")
         return 0
     end
 
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then setHitbox(p, HITBOX_SIZE) end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then Knife.set(player, Config.HitboxSize) end
     end
     task.wait(0.12)
 
-    -- Start the same slash the real KnifeClient starts, then feed the server a
-    -- touched part for every player. The direct HandleTouched calls are what do
-    -- the killing; KnifeStabbed just opens the normal stab window.
     local stabbed = events:FindFirstChild("KnifeStabbed")
     if stabbed and stabbed:IsA("RemoteEvent") then
         pcall(function() stabbed:FireServer() end)
@@ -2490,10 +2314,10 @@ local function knifeSweep()
     end
 
     local killed = 0
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and p.Character then
-            local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local hum = player.Character:FindFirstChildOfClass("Humanoid")
+            local hrp = player.Character:FindFirstChild("HumanoidRootPart")
             if hum and hum.Health > 0 and hrp then
                 pcall(function() touched:FireServer(hrp) end)
                 task.wait(0.04)
@@ -2502,163 +2326,170 @@ local function knifeSweep()
     end
 
     task.wait(0.25)
-    restoreHitboxes()
+    Knife.restore()
 
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and isDead(p) then killed = killed + 1 end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and Round.isDead(player) then killed = killed + 1 end
     end
     dbg("knifeSweep killed=", killed)
     return killed
 end
 
--- Fire a synced volley at the murderer. If none of the shots registered,
--- drop underground, idle for MissRetryDelay seconds, then let the combat loop
--- bring the character back up and try again.
-local function shootKillerWithMissRetry()
-    if not instanceAlive() or not Candy.Enabled or not roundActive or not isAlive() then return false end
-    if not playerHasGun() then return false end
+-- ==================== COMBAT ====================
+local Combat = {}
+function Combat.shootKiller(id)
+    if not workerOK(id) or not Round.active or not isAlive() then return false end
+    if not Gun.has() then return false end
 
-    local hit, fired = teleportShoot(true)
+    local hit, fired = Gun.shoot(true)
     if not fired then return false end
-    if hit or not murdererExists() then return true end
+    if hit or not Killer.exists() then return true end
 
-    cancelTween()
-    hideCharacter()
+    Motion.cancelTween()
+    Hide.hide()
     dbg("shot missed; hiding for", Config.MissRetryDelay, "seconds")
 
     local retryAt = tick() + math.max(tonumber(Config.MissRetryDelay) or 4, 0.5)
-    while instanceAlive() and Candy.Enabled and roundActive and isAlive() and tick() < retryAt do
-        if not murdererExists() then break end
-        if pollWaitingForTurn() then
-            handleWaitingForTurn()
+    while workerOK(id) and Round.active and isAlive() and tick() < retryAt do
+        if not Killer.exists() then break end
+        if WaitTurn.poll() then
+            WaitTurn.handle()
             break
         end
         task.wait(0.1)
     end
 
-    if instanceAlive() and Candy.Enabled and roundActive and isAlive()
-        and murdererExists() and Candy.Hidden then
-        unhideCharacter()
+    if workerOK(id) and Round.active and isAlive() and Killer.exists() and Hide.active then
+        Hide.unhide()
     end
     return false
 end
-
--- ==================== COMBAT PHASE ====================
-local function combatPhase()
+function Combat.phase(id)
     if not Config.AutoCombat then return false end
-    if not instanceAlive() or not Candy.Enabled or not roundActive or not isAlive() then return false end
-    if not bagFull() then return false end
+    if not workerOK(id) or not Round.active or not isAlive() then return false end
+    if Revenge.active or tick() < Motion.lockUntil then return false end
+    if not Bag.full() then return false end
 
-    unhideCharacter()
-    refreshPlayerData()
-    local role = myRole()
-    if not role then role = waitForRole(3) end
-    if not instanceAlive() or not isAlive() or not roundActive then return false end
-
+    Hide.unhide()
+    Round.refresh()
+    local role = Round.myRole() or Round.waitRole(3)
+    if not workerOK(id) or not isAlive() or not Round.active then return false end
     dbg("combat role=", tostring(role))
 
-    -- Murderer: hitboxes to 500, equip knife, remote slash everyone.
-    if role == "Murderer" or hasKnife(LocalPlayer) then
-        knifeSweep()
+    if role == "Murderer" or Killer.hasKnife(LocalPlayer) then
+        Knife.sweep()
         return true
     end
 
-    -- Sheriff (or an innocent who already picked up a gun).
-    if playerHasGun() then
-        equipGun()
-        shootKillerWithMissRetry()
+    if Gun.has() then
+        Gun.equip()
+        Combat.shootKiller(id)
         return true
     end
 
-    -- Innocent: fling whoever is carrying a gun (the sheriff, or an armed
-    -- innocent) until it drops, take it, then teleport-shoot the murderer.
     if role == "Innocent" or role == nil then
-        local holder = getSheriff() or findGunHolder()
+        local holder = Gun.sheriff() or Gun.holder()
         if holder then
             for attempt = 1, 2 do
-                if not instanceAlive() or not Candy.Enabled or not roundActive or not isAlive() then return false end
-                if not playerHasGun() and waitForGunDrop(0.2) then break end
+                if not workerOK(id) or not Round.active or not isAlive() then return false end
+                if not Gun.has() and Gun.waitForDrop(0.2) then break end
                 dbg("flinging gun holder", holder.Name, "attempt", attempt)
-                flingPlayer(holder, 2.0)
-                if waitForGunDrop(4) then break end
+                Fling.player(holder, 2.0)
+                if Gun.waitForDrop(4) then break end
             end
         end
     end
 
-    -- If the carrier died earlier (or the fling was enough), grab the drop.
-    if not playerHasGun() then
-        waitForGunDrop(4)
-    end
-    if not playerHasGun() then
-        teleportToGun(true)
-        waitForGun(1.5)
+    if not Gun.has() then Gun.waitForDrop(4) end
+    if not Gun.has() then
+        Gun.toDrop(true)
+        Gun.waitFor(1.5)
     end
 
-    if playerHasGun() and isAlive() and roundActive then
-        equipGun()
-        shootKillerWithMissRetry()
+    if Gun.has() and isAlive() and Round.active then
+        Gun.equip()
+        Combat.shootKiller(id)
         return true
     end
     return false
 end
+function Combat.untilEnd(id)
+    if Killer.isLocal() then
+        local ok, err = pcall(Combat.phase, id)
+        if not ok then warn("[combat] " .. tostring(err)) end
+        return
+    end
 
--- ==================== FARM ====================
-local farmRound
-farmRound = function()
+    local lastTry = 0
+    while workerOK(id) and Round.active and isAlive() and Bag.full() do
+        if WaitTurn.poll() then
+            WaitTurn.handle()
+            task.wait(0.15)
+            continue
+        end
+        if not Killer.exists() then break end
+
+        if tick() - lastTry >= 1.5 then
+            lastTry = tick()
+            local ok, err = pcall(Combat.phase, id)
+            if not ok then warn("[combat] " .. tostring(err)) end
+        end
+        task.wait(0.2)
+    end
+end
+
+-- ==================== FARM LOOP ====================
+local Farm = {}
+function Farm.run(id)
     local idleSince = tick()
-    while instanceAlive() and Candy.Enabled and roundActive and isAlive() do
-        if pollWaitingForTurn() then
-            handleWaitingForTurn()
+    while workerOK(id) and Round.active and isAlive() do
+        -- A fling, shot, gun teleport or revenge owns the root right now.
+        -- Waiting avoids a false "unreachable" penalty on the chosen candy.
+        if Motion.busy() then
             task.wait(0.1)
             continue
         end
 
-        -- No murderer means the round is effectively over. Stay hidden and
-        -- do nothing until a candy is actually visible again.
-        if not murdererExists() then
-            local list = findCandies(false)
+        if WaitTurn.poll() then
+            WaitTurn.handle()
+            task.wait(0.1)
+            continue
+        end
+
+        -- No murderer means the round is effectively over: stay hidden until a
+        -- candy is actually visible again.
+        if not Killer.exists() then
+            local list = Scan.list(false)
             if #list == 0 then
-                if not Candy.Hidden and tick() - idleSince > 0.4 then
-                    hideCharacter()
-                end
+                if not Candy.Hidden and tick() - idleSince > 0.4 then Hide.hide() end
                 task.wait(0.15)
                 continue
             end
         end
 
-        if bagFull() then
-            unhideCharacter()
+        if Bag.full() then
+            Hide.unhide()
             return "full"
         end
 
-        local list = findCandies(false)
-        local target, waitHint = selectBestPath(list)
+        local list = Scan.list(false)
+        local target, waitHint = Scan.best(list)
         if not target then
             if waitHint then
-                -- All currently safe candies are cooling down after failed
-                -- pickups. Stay on the surface and retry when the first one
-                -- is allowed again instead of hiding/unhiding repeatedly.
+                -- Every safe candy is cooling down after a failed pickup.
                 task.wait(math.min(waitHint, 0.25))
             else
-                -- No safe candy: go under the map and keep polling. As soon as
-                -- a safe candy appears we pop up above it and start moving.
-                if not Candy.Hidden and tick() - idleSince > 0.4 then
-                    hideCharacter()
-                end
+                if not Candy.Hidden and tick() - idleSince > 0.4 then Hide.hide() end
                 task.wait(0.1)
             end
         else
             idleSince = tick()
-            if Candy.Hidden then
-                unhideForCandy(target)
-            end
-            local got, reason = collectCandy(target)
+            if Candy.Hidden then Hide.unhideForCandy(target) end
+            local got, reason = Move.collect(target, id)
             if not got then
                 if reason == "unreachable" then
-                    markCandyFailure(target.obj)
-                elseif reason == "gone" then
-                    -- Someone else took it; just rescan on the next loop.
-                elseif reason ~= "disabled" and reason ~= "roundEnded" then
+                    Scan.markFailure(target.obj)
+                elseif reason ~= "gone" and reason ~= "disabled" and reason ~= "roundEnded" then
                     Candy.SkipUntil[target.obj] = math.max(
                         Candy.SkipUntil[target.obj] or 0,
                         tick() + 0.4
@@ -2669,128 +2500,116 @@ farmRound = function()
             end
         end
     end
-    return roundActive and "stopped" or "roundEnded"
-end
-
--- Once the bag is full, keep attempting combat until the round ends, the
--- murderer is gone, or the farm is toggled off. Without this the worker tried
--- combat exactly once and then idled until the round ended, which is what made
--- it look stuck at 50 candies.
-local function combatUntilRoundEnds()
-    if isLocalMurderer() then
-        local ok, err = pcall(combatPhase)
-        if not ok then warn("[combat] " .. tostring(err)) end
-        return
-    end
-
-    local lastTry = 0
-    while instanceAlive() and Candy.Enabled and roundActive and isAlive() and bagFull() do
-        if pollWaitingForTurn() then
-            handleWaitingForTurn()
-            task.wait(0.15)
-            continue
-        end
-        if not murdererExists() then break end
-
-        if tick() - lastTry >= 1.5 then
-            lastTry = tick()
-            local ok, err = pcall(combatPhase)
-            if not ok then warn("[combat] " .. tostring(err)) end
-        end
-        task.wait(0.2)
-    end
+    return Round.active and "stopped" or "roundEnded"
 end
 
 -- ==================== DEATH REVENGE ====================
--- If we die while the farm is running, the round is normally a lost cause.
--- After the character respawns, fling the murderer repeatedly until the round
--- ends. This deliberately includes deaths that happen with a full bag while the
--- synced shot is in progress: the old bagFull() early return meant a sheriff
--- killed mid-volley never got revenge. The handler is cancelled automatically
--- when a new round starts, the farm is disabled, or a newer death replaces it.
-local revengeToken = 0
+-- Dying while the shot is in flight used to leave the revenge fling racing the
+-- combat loop; now the shot publishes its intent, the combat loop backs off,
+-- and the fling waits until the root is free.
+local Death = { hum = nil, gen = 0, token = 0 }
+function Death.on()
+    if not instanceAlive() then return end
+    if not Candy.Enabled or not Round.active then return end
+    local wasShooting = Motion.shooting
 
-local function revengeAfterRespawn(serial, token)
-    while Candy.Enabled and roundActive and roundSerial == serial and not isAlive() do
-        if token ~= revengeToken or not instanceAlive() then return end
-        task.wait(0.2)
+    local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
+    local voidDeath = false
+    if Hide.lastY then
+        voidDeath = Hide.lastY <= destroyY + 40
+            or (Hide.surfaceY and Hide.lastY < Hide.surfaceY - 150)
     end
-    if token ~= revengeToken or not instanceAlive() then return end
-    if not Candy.Enabled or not roundActive or roundSerial ~= serial or not isAlive() then return end
-
-    unhideCharacter()
-    dbg("respawned after a death; flinging murderer")
-
-    local attempts = 0
-    while attempts < 4 do
-        if token ~= revengeToken or not instanceAlive() then return end
-        if not Candy.Enabled or not roundActive or roundSerial ~= serial or not isAlive() then return end
-        if not murdererExists() then break end
-
-        local killer = findKiller() or findMurdererPlayer()
-        if not killer then break end
-
-        attempts = attempts + 1
-        unhideCharacter()
-        local ok, displaced = pcall(flingPlayer, killer, 2.5)
-        dbg("revenge fling", killer.Name, "attempt", attempts, "displaced=", tostring(displaced))
-        if not ok then break end
-        task.wait(0.3)
+    if Hide.active or voidDeath then
+        Hide.hideDeaths = Hide.hideDeaths + 1
+        local block = Hide.hideDeaths >= 2 and 600 or 180
+        Hide.blockedUntil = math.max(Hide.blockedUntil, tick() + block)
+        dbg("death while hiding/in the void; hiding paused for", block, "seconds")
     end
-end
+    Hide.clear()
 
-local deathWatchHum = nil
-local deathWatchGeneration = 0
-local deathWatchCharConn = nil
+    Death.token = Death.token + 1
+    local token = Death.token
+    local serial = Round.serial
 
-local function onLocalDeath()
-    if not Candy.Enabled or not roundActive then return end
-
-    -- A death while hidden is either the void/kill-plane case or the murderer
-    -- reaching us under the map. Clear the hide state so the respawned body is
-    -- never dragged back to the old point, and stop hiding for a while if it
-    -- keeps happening.
-    if hidden then
-        hideDeathCount = hideDeathCount + 1
-        if hideDeathCount >= 2 then
-            hideBlockedUntil = math.max(hideBlockedUntil, tick() + 120)
-            dbg("hiding paused after", hideDeathCount, "deaths")
-        end
-        clearHideState()
+    if wasShooting then
+        -- Keep the combat loop off the root long enough for the fling.
+        Motion.lockUntil = tick() + 5
     end
+    dbg("death detected" .. (wasShooting and " while shooting" or "")
+        .. "; waiting for respawn to fling the murderer")
 
-    revengeToken = revengeToken + 1
-    local token = revengeToken
-    local serial = roundSerial
-    dbg("death detected" .. (isShooting and " while shooting" or "") .. "; waiting for respawn to fling the murderer")
+    -- Claim the root for the whole death/respawn window. This stops the combat
+    -- loop from starting a fresh teleport-shoot while the revenge is pending.
+    Revenge.active = true
     task.spawn(function()
-        revengeAfterRespawn(serial, token)
+        local ok, err = pcall(Death.revenge, serial, token)
+        if not ok then warn("[revenge] " .. tostring(err)) end
+        if token == Death.token or not Candy.Enabled then
+            Revenge.active = false
+        end
     end)
 end
 
-local function attachDeathWatch(char)
-    deathWatchGeneration = deathWatchGeneration + 1
-    local generation = deathWatchGeneration
+function Death.revenge(serial, token)
+    while Candy.Enabled and Round.active and Round.serial == serial and not isAlive() do
+        if token ~= Death.token or not instanceAlive() then return end
+        task.wait(0.15)
+    end
+    if token ~= Death.token or not instanceAlive() then return end
+    if not Candy.Enabled or not Round.active or Round.serial ~= serial or not isAlive() then return end
 
-    -- The old hide point belongs to the old body. Clearing it here is what
-    -- stops holdHidden from pulling the fresh character straight back into the
-    -- void after a respawn.
-    clearHideState()
+    Hide.unhide()
+    dbg("respawned after a death; flinging murderer")
 
-    if deathWatchHum then
-        pcall(function() deathWatchHum:Disconnect() end)
-        deathWatchHum = nil
+    local attempts = 0
+    while attempts < 20 do
+        if token ~= Death.token or not instanceAlive() then break end
+        if not Candy.Enabled or not Round.active or Round.serial ~= serial or not isAlive() then break end
+        if not Killer.exists() then break end
+
+        local killer = Killer.find()
+        if not killer then break end
+
+        -- Never fight an in-flight shot or gun teleport for the root.
+        local waited = 0
+        while (Motion.shooting or Motion.teleporting) and waited < 3 do
+            task.wait(0.1)
+            waited = waited + 0.1
+            if token ~= Death.token or not instanceAlive() then break end
+        end
+        if not Candy.Enabled or not Round.active or Round.serial ~= serial or not isAlive() then break end
+
+        attempts = attempts + 1
+        Hide.unhide()
+        Motion.cancelTween()
+        local ok, displaced = pcall(Fling.player, killer, 2.5)
+        dbg("revenge fling", killer.Name, "attempt", attempts, "displaced=", tostring(displaced))
+        if not ok then break end
+        if displaced then break end
+        task.wait(0.35)
+    end
+end
+
+function Death.attach(char)
+    if not instanceAlive() then return end
+    Death.gen = Death.gen + 1
+    local generation = Death.gen
+
+    -- The old hide point belongs to the old body.
+    Hide.clear()
+
+    if Death.hum then
+        pcall(function() Death.hum:Disconnect() end)
+        Death.hum = nil
     end
     if not char then return end
 
     local function connect(hum)
-        if generation ~= deathWatchGeneration then return end
+        if generation ~= Death.gen then return end
         if LocalPlayer.Character ~= char then return end
         if not hum or not hum.Parent then return end
-        local ok, conn = pcall(function()
-            return hum.Died:Connect(onLocalDeath)
-        end)
-        if ok and conn then deathWatchHum = conn end
+        local ok, conn = pcall(function() return hum.Died:Connect(Death.on) end)
+        if ok and conn then Death.hum = conn end
     end
 
     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -2799,286 +2618,36 @@ local function attachDeathWatch(char)
     else
         task.spawn(function()
             local waited = char:WaitForChild("Humanoid", 5)
-            if waited and generation == deathWatchGeneration then connect(waited) end
+            if waited and generation == Death.gen then connect(waited) end
         end)
     end
 end
 
-deathWatchCharConn = onCharacterAdded(attachDeathWatch)
-if LocalPlayer.Character then attachDeathWatch(LocalPlayer.Character) end
-
--- After a kick rejoin, the queued loader leaves a one-shot intent. If the same
--- round is still live and the murderer is alive, fling him before the normal
--- worker starts. If the round has already ended, return and let the worker
--- wait for the next round normally.
-local function runRejoinKickRevenge()
-    if not Candy.Enabled then return end
-    dbg("rejoin revenge: checking the rejoined server")
-
-    -- Only look for the round that was already running. Ten seconds is enough
-    -- for the timer/role data to replicate without waiting through the whole
-    -- intermission and accidentally flinging the next round's murderer.
-    local deadline = tick() + 10
-    while instanceAlive() and tick() < deadline do
-        if not Candy.Enabled then return end
-
-        if isAlive() then
-            if not roundActive then
-                detectActiveRound()
-                if not roundActive and not myRole() then
-                    waitForRole(1)
-                end
-            end
-
-            if roundActive then
-                -- If the timer says this is a freshly started round, do not
-                -- fling its murderer: the round we were kicked from is over,
-                -- so just wait for this one like normal.
-                if roundStartTime > 0 and tick() - roundStartTime < 4 then
-                    dbg("rejoin revenge: a new round started; waiting instead")
-                    return
-                end
-
-                -- The round may have just started replicating, so give the
-                -- role/knife data a few seconds before deciding the murderer
-                -- is gone.
-                local killer = nil
-                local killerWaitUntil = tick() + 4
-                repeat
-                    killer = findKiller() or findMurdererPlayer()
-                    if killer and not isDead(killer) then break end
-                    if not myRole() then waitForRole(1) end
-                    task.wait(0.4)
-                until tick() >= killerWaitUntil
-
-                if not killer or isDead(killer) then
-                    dbg("rejoin revenge: no living murderer in the active round")
-                    return
-                end
-
-                -- Let the character, role data and round timer settle after
-                -- the join before starting the fling.
-                task.wait(0.5)
-
-                local attempts = 0
-                while instanceAlive() and attempts < 3 and Candy.Enabled and roundActive and isAlive() do
-                    killer = findKiller() or findMurdererPlayer()
-                    if not killer or isDead(killer) then break end
-
-                    attempts = attempts + 1
-                    unhideCharacter()
-                    local ok, displaced = pcall(flingPlayer, killer, 2.5)
-                    dbg("rejoin revenge fling", killer.Name, "attempt", attempts, "displaced=", tostring(displaced))
-                    if not ok then break end
-                    task.wait(0.3)
-                end
-                return
-            end
-        end
-
-        task.wait(0.5)
-    end
-
-    dbg("rejoin revenge: no live round after the rejoin")
-end
-
--- ==================== WORKER ====================
-local function resetForRound()
-    Candy.Picked = 0
-    Candy.ServerCount = 0
-    Candy.Collected = 0
-    Candy.GuiCount = 0
-    Candy.GuiReadyAt = tick() + 0.8
-    Candy.Cache = {}
-    Candy.LastScan = 0
-    Candy.Busy = false
-    Candy.Target = nil
-    clearCandyMemory()
-end
-
-local function worker(id)
-    if Candy.ActiveWorker and Candy.ActiveWorker ~= id then return end
-    Candy.ActiveWorker = id
-    Candy.Running = true
-
-    if pendingRejoinKickRevenge then
-        pendingRejoinKickRevenge = false
-        local ok, err = pcall(runRejoinKickRevenge)
-        if not ok then warn("[rejoin] revenge failed: " .. tostring(err)) end
-    end
-
-    while instanceAlive() and Candy.Enabled and Candy.ActiveWorker == id do
-        if not roundActive then
-            detectActiveRound()
-        end
-
-        if not roundActive then
-            -- Idle between rounds/lobby: stay hidden too, still without anchoring.
-            if Candy.Enabled and isAlive() then
-                hideCharacter()
-            end
-            task.wait(0.25)
-        else
-            local serial = roundSerial
-
-            -- Round start: hide under the map while we wait for a role/candy.
-            if Candy.Enabled and isAlive() then
-                hideCharacter()
-            end
-
-            -- Make sure we have a role before doing anything.
-            if not myRole() then
-                waitForRole(3)
-            end
-
-            if Candy.Enabled and roundActive and roundSerial == serial then
-                resetForRound()
-                Candy.RoundSerial = serial
-
-                -- Wait for a living character (do not move an anchored/dead one).
-                while instanceAlive() and Candy.Enabled and roundActive and roundSerial == serial and not isAlive() do
-                    unhideCharacter()
-                    task.wait(0.25)
-                end
-
-                if Candy.Enabled and roundActive and roundSerial == serial and isAlive() then
-                    -- No delay: farmRound starts as soon as a candy is visible.
-                    local ok, status = xpcall(farmRound, function(err)
-                        return tostring(err) .. "\n" .. debug.traceback("", 2)
-                    end)
-                    if not ok then
-                        warn("[farm] " .. tostring(status))
-                        Candy.Busy = false
-                        Candy.Target = nil
-                    else
-                        dbg("farm ended:", tostring(status), Candy.Collected .. "/" .. tostring(bagTarget()))
-                    end
-
-                    if Candy.Enabled and roundActive and roundSerial == serial
-                        and isAlive() and bagFull() then
-                        local okCombat, err = pcall(combatUntilRoundEnds)
-                        if not okCombat then warn("[combat] " .. tostring(err)) end
-                    end
-
-                    -- After collecting/combat, idle until the round ends.
-                    if Candy.Enabled and roundActive and roundSerial == serial and isAlive() then
-                        hideCharacter()
-                    end
-                end
-            end
-
-            -- Wait for the round to end before starting another one.
-            local endedAt = tick()
-            while instanceAlive() and Candy.Enabled and roundActive and roundSerial == serial do
-                local t = readTimer()
-                if t and t <= 0 and tick() - endedAt > 1 then
-                    markRoundEnd("timer")
-                    break
-                end
-                task.wait(0.25)
-            end
-        end
-    end
-
-    if instanceAlive() and Candy.ActiveWorker == id then
-        cancelTween()
-        stopFling()
-        restoreHitboxes()
-        Candy.Running = false
-        Candy.ActiveWorker = nil
-        Candy.Busy = false
-        Candy.Target = nil
-        dbg("worker stopped")
-    end
-end
-
--- ==================== CHARACTER RELEASE / TOGGLE ====================
-local function releaseCharacter()
-    unhideCharacter()
-    cancelTween()
-    stopFling()
-    restoreHitboxes()
-
-    local root = getRoot()
-    if root then
-        root.Anchored = false
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        clearPhysicsRep(root)
-    end
-
-    local hum = getHumanoid()
-    if hum then
-        hum.PlatformStand = false
-        hum.AutoRotate = true
-        hum.CameraOffset = Vector3.zero
-    end
-end
-
-local function toggleCandy(state)
-    if not instanceAlive() then return end
-    state = not not state
-    if state == Candy.Enabled then
-        -- Re-assert the released state; this also fixes a root left anchored by
-        -- an older version of the script.
-        if not state then
-            releaseCharacter()
-            disableNoclip()
-            disableAnimationLock()
-        else
-            enableNoclip()
-            enableAnimationLock()
-        end
-        return
-    end
-
-    Candy.Enabled = state
-    runSerial = runSerial + 1
-    local id = runSerial
-
-    if state then
-        releaseCharacter()
-        enableNoclip()
-        enableAnimationLock()
-        clearCandyMemory()
-        Candy.Running = true
-        Candy.ActiveWorker = id
-        task.spawn(function() worker(id) end)
-        print("[AutoCandyFarm] enabled — waiting for round start")
-    else
-        Candy.ActiveWorker = nil
-        Candy.Running = false
-        Config.Armed = false
-        Candy.Busy = false
-        Candy.Target = nil
-        revengeToken = revengeToken + 1
-        clearCandyMemory()
-        releaseCharacter()
-        disableNoclip()
-        disableAnimationLock()
-        print("[AutoCandyFarm] disabled")
-    end
-end
+Death.charConn = onCharacterAdded(Death.attach)
+if LocalPlayer.Character then Death.attach(LocalPlayer.Character) end
 
 -- ==================== AUTO REJOIN / SERVER HOP ====================
--- GuiService.ErrorMessageChanged fires when Roblox shows a disconnect/kick
--- error. TeleportService still works for a short window while that message is
--- up, so reconnect as soon as the message changes.
-local autoRejoinConnection = nil
-local autoRejoinStarted = false
--- Register a loader for the next teleport. The queued code downloads this
--- script from the public URL after the teleport lands on the new server, then
--- runs it normally, so AutoStart brings the farm back up without a keypress.
--- `intent` is a one-shot table read by the new copy; for kick rejoins it says
--- the player was farming, which enables the "fling the murderer if the same
--- round is still live" step.
-local function queueReexecute(intent)
+local Rejoin = { conn = nil, started = false, pendingKickRevenge = false, intent = nil }
+do
+    local ok, stored = pcall(function() return genv.__mm2candy_rejoin end)
+    if ok and type(stored) == "table" then
+        genv.__mm2candy_rejoin = nil
+        local age = os.time() - (tonumber(stored.at) or 0)
+        if age >= 0 and age <= 300 then Rejoin.intent = stored end
+    end
+end
+Rejoin.pendingKickRevenge = Rejoin.intent ~= nil
+    and Rejoin.intent.kick == true
+    and Rejoin.intent.farming == true
+
+function Rejoin.queue(intent)
     if not Config.QueueReexecute then return false end
     local url = tostring(Config.ReexecuteUrl or "")
     if url == "" then return false end
 
     local env = getgenv()
-    local queue = env.queue_on_teleport or env.queueonteleport or env.queue_on_tp or env.queueontp
+    local queue = env.queue_on_teleport or env.queueonteleport
+        or env.queue_on_tp or env.queueontp
     if type(queue) ~= "function" then
         dbg("re-execution queue unavailable")
         return false
@@ -3125,13 +2694,7 @@ end
     return ok
 end
 
--- ==================== PUBLIC SERVER PICKER ====================
--- Read up to a few pages of the public server list. Roblox returns ping, fps,
--- playing and maxPlayers for every live server. The best candidate is the
--- lowest-ping server that is at least half of maxPlayers. excludeFullGames is
--- important: without it the first pages are all 12/12 servers and the picker
--- never sees a joinable candidate.
-local function fetchServerList(placeId)
+function Rejoin.fetchServers(placeId)
     local pages = math.clamp(tonumber(Config.ServerHopPages) or 2, 1, 5)
     local servers = {}
     local cursor = nil
@@ -3141,10 +2704,9 @@ local function fetchServerList(placeId)
             "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100",
             placeId
         )
-
         if cursor and cursor ~= "" then
             local okEncode, encoded = pcall(function()
-                return HttpService:UrlEncode(cursor)
+                return S.HttpService:UrlEncode(cursor)
             end)
             if not okEncode or type(encoded) ~= "string" then break end
             url = url .. "&cursor=" .. encoded
@@ -3159,7 +2721,7 @@ local function fetchServerList(placeId)
         end
 
         local okDecode, data = pcall(function()
-            return HttpService:JSONDecode(body)
+            return S.HttpService:JSONDecode(body)
         end)
         if not okDecode or type(data) ~= "table" or type(data.data) ~= "table" then
             dbg("server list decode failed:", tostring(data))
@@ -3179,8 +2741,8 @@ local function fetchServerList(placeId)
     return servers
 end
 
-local function pickBestServer(placeId, excludeJobId)
-    local servers = fetchServerList(placeId)
+function Rejoin.pickServer(placeId, excludeJobId)
+    local servers = Rejoin.fetchServers(placeId)
     if not servers then return nil, nil end
 
     local minFill = math.clamp(tonumber(Config.ServerHopMinFill) or 0.5, 0, 1)
@@ -3223,49 +2785,43 @@ local function pickBestServer(placeId, excludeJobId)
     return chosen and chosen.id or nil, chosen
 end
 
--- Kick/disconnect path: return to the same server so the current round can be
--- recovered. If that exact server is unavailable, use the best public server.
-local function attemptAutoRejoin(reason, intent)
+function Rejoin.attempt(reason, intent)
     if not Config.AutoRejoin then return false end
     dbg("auto-rejoin triggered", tostring(reason))
 
     local rejoinIntent = intent or {
         kick = true,
-        farming = Candy.Enabled and roundActive,
+        farming = Candy.Enabled and Round.active,
     }
 
-    queueReexecute(rejoinIntent)
-    wait()
+    Rejoin.queue(rejoinIntent)
+    task.wait(0.1)
 
     local ok = pcall(function()
-        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        S.TeleportService:Teleport(game.PlaceId, LocalPlayer)
     end)
     dbg("rejoin teleport", ok and "sent" or "failed")
     return ok
 end
 
--- Timeout path: no round for AutoRejoinNoRoundTimeout seconds. Hop to a
--- different server, preferring half-full servers with the lowest ping.
-local function hopToBestServer(reason)
-    if not Config.AutoRejoin or autoRejoinStarted then return end
-    autoRejoinStarted = true
+function Rejoin.hop(reason)
+    if not Config.AutoRejoin or Rejoin.started then return end
+    Rejoin.started = true
     dbg("server hop triggered", tostring(reason))
 
-    -- This is a fresh round/server, so the re-executed copy must not run the
-    -- kicked-while-farming revenge.
-    queueReexecute({ kick = false, farming = Candy.Enabled })
+    Rejoin.queue({ kick = false, farming = Candy.Enabled })
 
     task.spawn(function()
         local minFill = math.clamp(tonumber(Config.ServerHopMinFill) or 0.5, 0, 1)
         local currentJobId = game.JobId
 
-        for attempt = 1, 12 do
-            if not Candy.Enabled then
-                autoRejoinStarted = false
+        for _ = 1, 12 do
+            if not instanceAlive() or not Candy.Enabled then
+                Rejoin.started = false
                 return
             end
 
-            local jobId, info = pickBestServer(game.PlaceId, game.JobId)
+            local jobId, info = Rejoin.pickServer(game.PlaceId, game.JobId)
             if jobId then
                 dbg(string.format(
                     "hop pick %s (%d/%d, %.0f%%, ping %s)",
@@ -3277,12 +2833,10 @@ local function hopToBestServer(reason)
                 end
 
                 local ok = pcall(function()
-                    TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer)
+                    S.TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer)
                 end)
                 if ok then
                     task.wait(3)
-                    -- If the client actually moved, this copy is about to be
-                    -- destroyed. If it is still on the same job, retry.
                     if game.JobId ~= currentJobId then return end
                 end
             else
@@ -3292,93 +2846,333 @@ local function hopToBestServer(reason)
             task.wait(math.max(tonumber(Config.ServerHopRetryDelay) or 5, 1))
         end
 
-        if not Candy.Enabled then
-            autoRejoinStarted = false
+        if not instanceAlive() or not Candy.Enabled then
+            Rejoin.started = false
             return
         end
 
-        -- Do not stay stuck if the API/server list is unavailable.
         dbg("server hop retries exhausted; falling back to Teleport")
         pcall(function()
-            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            S.TeleportService:Teleport(game.PlaceId, LocalPlayer)
         end)
-        autoRejoinStarted = false
+        Rejoin.started = false
     end)
 end
 
-local function setupAutoRejoin()
-    if not Config.AutoRejoin or autoRejoinConnection then return end
-
+function Rejoin.setup()
+    if not Config.AutoRejoin or Rejoin.conn then return end
     local ok, connection = pcall(function()
-        return GuiService.ErrorMessageChanged:Connect(function(errorMessage)
-            if type(errorMessage) ~= "string" or errorMessage == "" then
-                return
-            end
-
+        return S.GuiService.ErrorMessageChanged:Connect(function(errorMessage)
+            if not instanceAlive() then return end
+            if type(errorMessage) ~= "string" or errorMessage == "" then return end
             print("Error detected: " .. tostring(errorMessage))
             if LocalPlayer then
-                attemptAutoRejoin("GuiService: " .. tostring(errorMessage), {
+                Rejoin.attempt("GuiService: " .. tostring(errorMessage), {
                     kick = true,
-                    farming = Candy.Enabled and roundActive,
+                    farming = Candy.Enabled and Round.active,
                 })
             end
         end)
     end)
-
     if ok and connection then
-        autoRejoinConnection = connection
+        Rejoin.conn = connection
     else
         dbg("GuiService.ErrorMessageChanged unavailable:", tostring(connection))
     end
 end
 
-setupAutoRejoin()
+-- Rejoin kick revenge: only touch the round that was already live.
+function Rejoin.runKickRevenge()
+    if not Candy.Enabled then return end
+    dbg("rejoin revenge: checking the rejoined server")
 
--- ==================== NO-ROUND SERVER HOP WATCHDOG ====================
--- If no round starts for the configured timeout, hop to a half-full public
--- server with the lowest ping instead of rejoining the same dead server.
-task.spawn(function()
-    while Config.AutoRejoin do
-        task.wait(1)
+    local deadline = tick() + 10
+    while instanceAlive() and tick() < deadline do
+        if not Candy.Enabled then return end
 
-        if not Candy.Enabled then
-            roundWaitingSince = tick()
-        elseif autoRejoinStarted then
-            task.wait(1)
-        elseif roundActive then
-            roundWaitingSince = nil
-        else
-            if not roundWaitingSince then
-                roundWaitingSince = tick()
+        if isAlive() then
+            if not Round.active then
+                Round.detect()
+                if not Round.active and not Round.myRole() then Round.waitRole(1) end
             end
 
-            local timeout = math.max(
-                tonumber(Config.AutoRejoinNoRoundTimeout) or 90,
-                1
-            )
-            if tick() - roundWaitingSince >= timeout then
+            if Round.active then
+                if Round.startTime > 0 and tick() - Round.startTime < 4 then
+                    dbg("rejoin revenge: a new round started; waiting instead")
+                    return
+                end
+
+                local killer = nil
+                local killerWaitUntil = tick() + 4
+                repeat
+                    killer = Killer.find()
+                    if killer and not Round.isDead(killer) then break end
+                    if not Round.myRole() then Round.waitRole(1) end
+                    task.wait(0.4)
+                until tick() >= killerWaitUntil
+
+                if not killer or Round.isDead(killer) then
+                    dbg("rejoin revenge: no living murderer in the active round")
+                    return
+                end
+
+                task.wait(0.5)
+
+                local attempts = 0
+                while instanceAlive() and attempts < 3 and Candy.Enabled
+                    and Round.active and isAlive() do
+                    killer = Killer.find()
+                    if not killer or Round.isDead(killer) then break end
+                    attempts = attempts + 1
+                    Hide.unhide()
+                    local ok, displaced = pcall(Fling.player, killer, 2.5)
+                    dbg("rejoin revenge fling", killer.Name, "attempt", attempts,
+                        "displaced=", tostring(displaced))
+                    if not ok then break end
+                    task.wait(0.3)
+                end
+                return
+            end
+        end
+
+        task.wait(0.5)
+    end
+
+    dbg("rejoin revenge: no live round after the rejoin")
+end
+
+-- ==================== WORKER ====================
+local Worker = {}
+local function resetForRound()
+    Candy.Picked = 0
+    Candy.ServerCount = 0
+    Candy.Collected = 0
+    Candy.GuiReadyAt = tick() + 0.8
+    Candy.Cache = {}
+    Candy.LastScan = 0
+    Candy.Busy = false
+    Candy.Target = nil
+    Scan.clearMemory()
+end
+
+function Worker.run(id)
+    if Candy.ActiveWorker and Candy.ActiveWorker ~= id then return end
+    Candy.ActiveWorker = id
+    Candy.Running = true
+
+    if Rejoin.pendingKickRevenge then
+        Rejoin.pendingKickRevenge = false
+        local ok, err = pcall(Rejoin.runKickRevenge)
+        if not ok then warn("[rejoin] revenge failed: " .. tostring(err)) end
+    end
+
+    while instanceAlive() and Candy.Enabled and Candy.ActiveWorker == id do
+        if not Round.active then Round.detect() end
+
+        if not Round.active then
+            if Candy.Enabled and isAlive() then Hide.hide() end
+            task.wait(0.25)
+        else
+            local serial = Round.serial
+
+            -- Only hide at round start when there is genuinely nothing to farm.
+            if Candy.Enabled and isAlive() then
+                local list = Scan.list(true)
+                if #list == 0 then Hide.hide() end
+            end
+
+            if not Round.myRole() then Round.waitRole(3) end
+
+            if instanceAlive() and Candy.Enabled and Round.active and Round.serial == serial then
+                resetForRound()
+
+                while instanceAlive() and Candy.Enabled and Round.active
+                    and Round.serial == serial and not isAlive() do
+                    Hide.unhide()
+                    task.wait(0.25)
+                end
+
+                if instanceAlive() and Candy.Enabled and Round.active
+                    and Round.serial == serial and isAlive() then
+                    local ok, status = xpcall(function()
+                        return Farm.run(id)
+                    end, function(err)
+                        return tostring(err) .. "\n" .. debug.traceback("", 2)
+                    end)
+                    if not ok then
+                        warn("[farm] " .. tostring(status))
+                        Candy.Busy = false
+                        Candy.Target = nil
+                    else
+                        dbg("farm ended:", tostring(status),
+                            Candy.Collected .. "/" .. tostring(bagTarget()))
+                    end
+
+                    if instanceAlive() and Candy.Enabled and Round.active
+                        and Round.serial == serial and isAlive() and Bag.full() then
+                        local okCombat, errCombat = pcall(Combat.untilEnd, id)
+                        if not okCombat then warn("[combat] " .. tostring(errCombat)) end
+                    end
+
+                    if instanceAlive() and Candy.Enabled and Round.active
+                        and Round.serial == serial and isAlive() then
+                        Hide.hide()
+                    end
+                end
+            end
+
+            local endedAt = tick()
+            while instanceAlive() and Candy.Enabled and Round.active
+                and Round.serial == serial do
+                local t = Round.readTimer()
+                if t and t <= 0 and tick() - endedAt > 1 then
+                    Round.markEnd("timer")
+                    break
+                end
+                task.wait(0.25)
+            end
+        end
+    end
+
+    if instanceAlive() and Candy.ActiveWorker == id then
+        Motion.cancelTween()
+        Fling.stop()
+        Knife.restore()
+        Candy.Running = false
+        Candy.ActiveWorker = nil
+        Candy.Busy = false
+        Candy.Target = nil
+        dbg("worker stopped")
+    end
+end
+
+-- ==================== CHARACTER RELEASE / TOGGLE ====================
+local function releaseCharacter()
+    Hide.unhide()
+    Motion.cancelTween()
+    Fling.stop()
+    Knife.restore()
+
+    local root = getRoot()
+    if root then
+        root.Anchored = false
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        Phys.clear(root)
+    end
+
+    local hum = getHumanoid()
+    if hum then
+        hum.PlatformStand = false
+        hum.AutoRotate = true
+        hum.CameraOffset = Vector3.zero
+    end
+end
+
+local function toggleCandy(state)
+    if not instanceAlive() then return end
+    state = not not state
+    if state == Candy.Enabled then
+        if not state then
+            releaseCharacter()
+            Noclip.disable()
+            AnimLock.disable()
+        else
+            Noclip.enable()
+            AnimLock.enable()
+        end
+        return
+    end
+
+    Candy.Enabled = state
+    if state then
+        releaseCharacter()
+        Noclip.enable()
+        AnimLock.enable()
+        Scan.clearMemory()
+        Candy.Running = true
+        Candy.WorkerSerial = (tonumber(Candy.WorkerSerial) or 0) + 1
+        local id = Candy.WorkerSerial
+        Candy.ActiveWorker = id
+        task.spawn(function() Worker.run(id) end)
+        print("[AutoCandyFarm] enabled - waiting for round start")
+    else
+        Candy.ActiveWorker = nil
+        Candy.Running = false
+        Candy.Busy = false
+        Candy.Target = nil
+        Death.token = Death.token + 1
+        Revenge.active = false
+        Motion.lockUntil = 0
+        Scan.clearMemory()
+        releaseCharacter()
+        Noclip.disable()
+        AnimLock.disable()
+        print("[AutoCandyFarm] disabled")
+    end
+end
+
+Rejoin.setup()
+
+-- ==================== NO-ROUND SERVER HOP WATCHDOG ====================
+-- Bound to the instance token; a previous copy can never keep hopping after a
+-- re-execution (that produced two clients fighting over teleports).
+task.spawn(function()
+    while instanceAlive() and Config.AutoRejoin do
+        task.wait(1)
+        if not instanceAlive() then return end
+
+        if not Candy.Enabled then
+            Round.waitingSince = tick()
+        elseif Rejoin.started then
+            task.wait(1)
+        elseif Round.active then
+            Round.waitingSince = nil
+        else
+            if not Round.waitingSince then Round.waitingSince = tick() end
+            local timeout = math.max(tonumber(Config.AutoRejoinNoRoundTimeout) or 90, 1)
+            if tick() - Round.waitingSince >= timeout then
                 dbg("no round started within", timeout, "seconds; hopping servers")
-                hopToBestServer("no round started for " .. tostring(timeout) .. " seconds")
+                Rejoin.hop("no round started for " .. tostring(timeout) .. " seconds")
             end
         end
     end
 end)
 
 -- ==================== INPUT ====================
-local lastHome = 0
-local inputConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    if input.KeyCode ~= Enum.KeyCode.Home then return end
-    local now = tick()
-    if now - lastHome < 0.35 then return end
-    lastHome = now
-    toggleCandy(not Candy.Enabled)
-end)
+local inputConnection
+do
+    local lastHome = 0
+    inputConnection = S.UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode ~= Enum.KeyCode.Home then return end
+        local now = tick()
+        if now - lastHome < 0.35 then return end
+        lastHome = now
+        toggleCandy(not Candy.Enabled)
+    end)
+end
 
--- Clear any anchor left behind by the previous version immediately.
+-- Clear any anchor left behind by a previous version immediately.
 task.defer(function()
     local root = getRoot()
     if root then root.Anchored = false end
+end)
+
+-- Void watchdog is always on; it only acts while the farm is enabled.
+Hide.startWatch()
+
+-- ==================== LEASE HEARTBEAT ====================
+-- Keeps the duplicate-execution guard fresh while this copy is loaded. When
+-- this copy stops, the heartbeat stops, so a later execution can take over
+-- after the stale timeout.
+task.spawn(function()
+    while instanceAlive() do
+        local lease = genv[LEASE_KEY]
+        if type(lease) ~= "table" or lease.id ~= leaseToken then return end
+        lease.heartbeat = tick()
+        task.wait(0.5)
+    end
 end)
 
 -- ==================== TEARDOWN ====================
@@ -3388,99 +3182,102 @@ P.teardown = function()
     Candy.Running = false
     Candy.Busy = false
     Candy.Target = nil
-    revengeToken = revengeToken + 1
-    clearCandyMemory()
-    runSerial = runSerial + 1
+    Death.token = Death.token + 1
+    Scan.clearMemory()
 
-    if deathWatchHum then
-        pcall(function() deathWatchHum:Disconnect() end)
-        deathWatchHum = nil
-    end
-    if deathWatchCharConn then
-        pcall(function() deathWatchCharConn:Disconnect() end)
-        deathWatchCharConn = nil
-    end
-    if autoRejoinConnection then
-        pcall(function() autoRejoinConnection:Disconnect() end)
-        autoRejoinConnection = nil
+    local lease = genv[LEASE_KEY]
+    if type(lease) == "table" and lease.id == leaseToken then
+        lease.alive = false
+        lease.heartbeat = 0
     end
 
+    if Death.hum then
+        pcall(function() Death.hum:Disconnect() end)
+        Death.hum = nil
+    end
+    if Death.charConn then
+        pcall(function() Death.charConn:Disconnect() end)
+        Death.charConn = nil
+    end
+    if Rejoin.conn then
+        pcall(function() Rejoin.conn:Disconnect() end)
+        Rejoin.conn = nil
+    end
+    for _, conn in ipairs(Round.conns) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(Round.conns)
     if inputConnection then
         pcall(function() inputConnection:Disconnect() end)
         inputConnection = nil
     end
-    for _, conn in ipairs(roundConnections) do
-        pcall(function() conn:Disconnect() end)
-    end
-    table.clear(roundConnections)
 
-    clearHideState()
+    Hide.stopWatch()
     releaseCharacter()
-    disableNoclip()
-    disableAnimationLock()
+    Noclip.disable()
+    AnimLock.disable()
     P.teardown = nil
 end
 
 -- ==================== API ====================
 P.api = {
-    toggle         = toggleCandy,
-    state          = function() return Candy end,
-    config         = function() return Config end,
-    round          = function()
+    toggle          = toggleCandy,
+    state           = function() return Candy end,
+    config          = function() return Config end,
+    round           = function()
         return {
-            active = roundActive,
-            startTime = roundStartTime,
-            serial = roundSerial,
-            role = myRole(),
-            timeLeft = select(1, readTimer()),
+            active = Round.active,
+            startTime = Round.startTime,
+            serial = Round.serial,
+            role = Round.myRole(),
+            timeLeft = select(1, Round.readTimer()),
         }
     end,
-    playerData     = function() return playerData end,
-    role           = myRole,
-    findCandies    = findCandies,
-    selectNearest  = selectNearest,
-    selectBestPath = selectBestPath,
-    plan           = function() return Candy.Plan end,
-    collectCandy   = collectCandy,
-    knifeSweep     = knifeSweep,
-    teleportShoot  = teleportShoot,
-    teleportToGun  = teleportToGun,
-    flingSheriff   = function()
-        local sheriff = getSheriff()
+    playerData      = function() return Round.data end,
+    role            = Round.myRole,
+    findCandies     = Scan.list,
+    selectNearest   = Scan.best,
+    selectBestPath  = Scan.best,
+    plan            = function() return Candy.Plan end,
+    collectCandy    = function(target) return Move.collect(target) end,
+    knifeSweep      = Knife.sweep,
+    teleportShoot   = Gun.shoot,
+    teleportToGun   = Gun.toDrop,
+    flingSheriff    = function()
+        local sheriff = Gun.sheriff()
         if not sheriff then return false end
-        return flingPlayer(sheriff, 2.0)
+        return Fling.player(sheriff, 2.0)
     end,
-    combat         = combatPhase,
-    hasGun         = playerHasGun,
-    findGunHolder  = findGunHolder,
-    isWaiting      = pollWaitingForTurn,
-    hide           = hideCharacter,
-    unhide         = unhideCharacter,
-    isHidden       = function() return Candy.Hidden end,
-    bagCount       = readCandyGuiCount,
-    isBagFull      = bagFull,
-    release        = releaseCharacter,
-    rejoin         = function()
-        autoRejoinStarted = false
-        attemptAutoRejoin("manual", {
+    combat          = Combat.phase,
+    hasGun          = Gun.has,
+    findGunHolder   = Gun.holder,
+    isWaiting       = WaitTurn.poll,
+    hide            = Hide.hide,
+    unhide          = Hide.unhide,
+    isHidden        = function() return Candy.Hidden end,
+    bagCount        = Bag.count,
+    isBagFull       = Bag.full,
+    release         = releaseCharacter,
+    voidRecover     = Hide.recover,
+    rejoin          = function()
+        Rejoin.started = false
+        Rejoin.attempt("manual", {
             kick = true,
-            farming = Candy.Enabled and roundActive,
+            farming = Candy.Enabled and Round.active,
         })
     end,
-    hop            = function()
-        autoRejoinStarted = false
-        hopToBestServer("manual")
+    hop             = function()
+        Rejoin.started = false
+        Rejoin.hop("manual")
     end,
-    markRoundStart = function() markRoundStart("manual") end,
-    markRoundEnd   = function() markRoundEnd("manual") end,
+    markRoundStart  = function() Round.markStart("manual") end,
+    markRoundEnd    = function() Round.markEnd("manual") end,
 }
 
 print("[AutoCandyFarm] loaded - auto-starting; press Home to pause.")
 
 if Config.AutoStart ~= false then
     task.defer(function()
-        -- Let any previous copy finish tearing down and give the character a
-        -- moment to spawn, then start farming without waiting for a keypress.
         task.wait(0.3)
         if not Candy.Enabled then
             toggleCandy(true)
