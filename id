@@ -121,7 +121,7 @@ local Config = {
     CandyCap             = 50,
     CandyCacheTTL        = 0.5,
     CandyMaxDistance     = 20000,
-    TweenSpeed           = 30,
+    TweenSpeed           = 25,
     KillerIgnoreRadius   = 10,
     KillerIgnoreHeight   = 10,
     -- Combat
@@ -152,7 +152,7 @@ local Config = {
     PickupFinishTime     = 0.12,
     -- Rejoin / hop
     AutoRejoin           = true,
-    AutoRejoinNoRoundTimeout = 90,
+    AutoRejoinNoRoundTimeout = 130,
     ServerHopMinFill     = 0.5,
     ServerHopPages       = 2,
     ServerHopRetryDelay  = 5,
