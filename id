@@ -16,6 +16,9 @@
 --    * Duplicate execution: the live copy holds a heartbeat lease in getgenv.
 --      A second execution now prints a notice and exits without touching the
 --      first (set getgenv().__mm2candy_force = true first to replace it).
+--    * Opening snap: as soon as the round's first candy is visible, the root
+--      teleports straight to it once, then resumes the normal tween farming.
+--      A per-round serial guard makes the snap strictly one-shot.
 --    * Register pressure: state lives in tables and self-contained systems are
 --      scoped in do-blocks, keeping the main chunk well under the 200-local
 --      "out of local registers" limit.
@@ -118,7 +121,7 @@ local Config = {
     CandyCap             = 50,
     CandyCacheTTL        = 0.5,
     CandyMaxDistance     = 20000,
-    TweenSpeed           = 30,
+    TweenSpeed           = 25,
     KillerIgnoreRadius   = 10,
     KillerIgnoreHeight   = 10,
     -- Combat
@@ -147,7 +150,7 @@ local Config = {
     PickupFinishTime     = 0.12,
     -- Rejoin / hop
     AutoRejoin           = true,
-    AutoRejoinNoRoundTimeout = 90,
+    AutoRejoinNoRoundTimeout = 170,
     ServerHopMinFill     = 0.5,
     ServerHopPages       = 2,
     ServerHopRetryDelay  = 5,
@@ -171,6 +174,7 @@ Candy.GuiReadyAt    = 0
 Candy.Target        = nil
 Candy.Busy          = false
 Candy.Hidden        = false
+Candy.FirstTeleportSerial = nil -- round serial that used its one-shot snap
 Candy.Cache         = Candy.Cache or {}
 Candy.LastScan      = 0
 Candy.SkipUntil     = Candy.SkipUntil or {}
@@ -1495,6 +1499,39 @@ function Move.to(goalPos, speed, stopFn, touchPart)
     return finished
 end
 
+-- One-shot snap used for the first candy of a round. Teleporting from the
+-- spawn point (or from under the map while hidden) saves the opening seconds;
+-- the rest of the round keeps using the normal tween path. Returns true only
+-- if the root was actually moved, so the caller can mark the round consumed.
+function Move.firstTeleport(target)
+    if not target or not target.obj or not target.obj.Parent then return false end
+    if not instanceAlive() or not Candy.Enabled or not Round.active or not isAlive() then
+        return false
+    end
+    if Motion.busy() or Motion.tween then return false end
+
+    local obj = target.obj
+    if not Scan.safe(obj) then return false end
+    local root = getRoot()
+    if not root then return false end
+
+    Hide.clear()
+    Motion.cancelTween()
+
+    local pos = obj.Position + Vector3.new(0, 3, 0)
+    root.Anchored = false
+    root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    if Config.Noclip then
+        Noclip.enable()
+        Noclip.apply()
+    end
+    fireTouch(root, obj)
+    dbg("first candy teleport", obj:GetFullName())
+    return true
+end
+
 function Move.collect(target, id)
     if not target or not Scan.available(target.obj) then return false, "gone" end
     if Motion.busy() then return false, "busy" end
@@ -2484,7 +2521,20 @@ function Farm.run(id)
             end
         else
             idleSince = tick()
-            if Candy.Hidden then Hide.unhideForCandy(target) end
+
+            -- The first candy of a round gets one instant snap; waiting for
+            -- the tween from spawn (or from under the map) costs the opening
+            -- seconds. Round.serial is the guard: at most one snap per round.
+            if Candy.FirstTeleportSerial ~= Round.serial then
+                if Move.firstTeleport(target) then
+                    Candy.FirstTeleportSerial = Round.serial
+                elseif Candy.Hidden then
+                    Hide.unhideForCandy(target)
+                end
+            elseif Candy.Hidden then
+                Hide.unhideForCandy(target)
+            end
+
             local got, reason = Move.collect(target, id)
             if not got then
                 if reason == "unreachable" then
