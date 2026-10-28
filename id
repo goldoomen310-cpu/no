@@ -121,7 +121,7 @@ local Config = {
     CandyCap             = 50,
     CandyCacheTTL        = 0.5,
     CandyMaxDistance     = 20000,
-    TweenSpeed           = 25,
+    TweenSpeed           = 30,
     KillerIgnoreRadius   = 10,
     KillerIgnoreHeight   = 10,
     -- Combat
@@ -146,17 +146,31 @@ local Config = {
     -- Movement
     Noclip               = true,
     MoveUnanchorAt       = 0.8,
-    EarlyTouchDistance   = 5,
+    -- Simulated touches are fired as soon as a candy is within this many
+    -- studs (3D distance), so a candy ~5 studs overhead is still collected.
+    EarlyTouchDistance   = 10,
     PickupFinishTime     = 0.12,
     -- Rejoin / hop
     AutoRejoin           = true,
-    AutoRejoinNoRoundTimeout = 170,
+    AutoRejoinNoRoundTimeout = 90,
     ServerHopMinFill     = 0.5,
     ServerHopPages       = 2,
     ServerHopRetryDelay  = 5,
     ServerHopAllowFallback = true,
     QueueReexecute       = true,
     ReexecuteUrl         = "https://raw.githubusercontent.com/goldoomen310-cpu/no/refs/heads/main/id",
+    -- Auto-buy / open the Halloween Box '26. The event shop treats the two
+    -- price entries as separate purchase options, so 600 Candies2026 opens
+    -- one box (the HalloweenKey2026 option is a different button).
+    AutoBuyBox           = true,
+    AutoBuyBoxInterval   = 5,
+    AutoBuyBoxId         = "Halloween2026Box",
+    AutoBuyBoxName       = "Halloween Box '26",
+    AutoBuyBoxCurrency   = "Candies2026",
+    AutoBuyBoxPrice      = 600,
+    -- Discord report, sent once per successful crate open.
+    WebhookUrl           = "https://discord.com/api/webhooks/1390733232491986944/9fWTrWzVtBk1SEh_8iwWT0i6IyneGz9PmXUwuU19aphbkBTi2_7QtJannAQVz6lf8CGa",
+    WebhookName          = "AutoCandyFarm",
 }
 
 local Candy = P.candy
@@ -192,6 +206,235 @@ end
 if type(P.teardown) == "function" then
     pcall(P.teardown)
 end
+
+-- ==================== PERSISTENT STATS + DISCORD WEBHOOK ====================
+-- The executor environment is recreated on a rejoin or server hop, so these
+-- counters live in a workspace file instead of getgenv. They start at the
+-- first execution and are only reset through P.api.resetStats().
+local Stats = {
+    path = "AutoCandyFarm/stats.json",
+    firstRun = os.time(),
+    activeSeconds = 0,
+    candies = 0,
+    cratesOpened = 0,
+    rejoins = 0,
+    hops = 0,
+    rewards = {},
+    sessionStart = tick(),
+}
+do
+    local function loadSaved()
+        if type(isfile) ~= "function" or type(readfile) ~= "function" then
+            return nil
+        end
+        local okExists, exists = pcall(isfile, Stats.path)
+        if not okExists or exists ~= true then return nil end
+        local okRead, raw = pcall(readfile, Stats.path)
+        if not okRead or type(raw) ~= "string" or raw == "" then return nil end
+        local okDecode, data = pcall(function()
+            return S.HttpService:JSONDecode(raw)
+        end)
+        if not okDecode or type(data) ~= "table" then return nil end
+        return data
+    end
+
+    local saved = loadSaved()
+    if type(saved) == "table" then
+        Stats.firstRun = tonumber(saved.firstRun) or Stats.firstRun
+        Stats.activeSeconds = math.max(0, tonumber(saved.activeSeconds) or 0)
+        Stats.candies = math.max(0, tonumber(saved.candies) or 0)
+        Stats.cratesOpened = math.max(0, tonumber(saved.cratesOpened) or 0)
+        Stats.rejoins = math.max(0, tonumber(saved.rejoins) or 0)
+        Stats.hops = math.max(0, tonumber(saved.hops) or 0)
+        if type(saved.rewards) == "table" then
+            for _, record in ipairs(saved.rewards) do
+                if type(record) == "table" then
+                    Stats.rewards[#Stats.rewards + 1] = {
+                        id = tostring(record.id or ""),
+                        name = tostring(record.name or record.id or "?"),
+                        type = tostring(record.type or "Item"),
+                        rarity = tostring(record.rarity or "?"),
+                        at = tonumber(record.at) or 0,
+                    }
+                end
+            end
+        end
+    end
+    Stats.sessionStart = tick()
+
+    function Stats.runtime()
+        return Stats.activeSeconds + math.max(0, tick() - Stats.sessionStart)
+    end
+
+    function Stats.runtimeText()
+        local total = math.floor(Stats.runtime())
+        local days = math.floor(total / 86400)
+        local hours = math.floor((total % 86400) / 3600)
+        local minutes = math.floor((total % 3600) / 60)
+        local seconds = total % 60
+        if days > 0 then
+            return string.format("%dd %dh %dm", days, hours, minutes)
+        elseif hours > 0 then
+            return string.format("%dh %dm %ds", hours, minutes, seconds)
+        end
+        return string.format("%dm %ds", minutes, seconds)
+    end
+
+    function Stats.save()
+        if type(writefile) ~= "function" then return false end
+        local snapshot = {
+            version = 1,
+            firstRun = Stats.firstRun,
+            activeSeconds = Stats.runtime(),
+            candies = Stats.candies,
+            cratesOpened = Stats.cratesOpened,
+            rejoins = Stats.rejoins,
+            hops = Stats.hops,
+            rewards = Stats.rewards,
+            savedAt = os.time(),
+        }
+        local okEncode, encoded = pcall(function()
+            return S.HttpService:JSONEncode(snapshot)
+        end)
+        if not okEncode or type(encoded) ~= "string" then return false end
+        local okWrite = pcall(writefile, Stats.path, encoded)
+        return okWrite == true
+    end
+
+    function Stats.addCandy(amount)
+        Stats.candies = math.max(0, Stats.candies + (tonumber(amount) or 1))
+    end
+
+    function Stats.addCrate(record)
+        Stats.cratesOpened = Stats.cratesOpened + 1
+        if type(record) ~= "table" then return end
+        Stats.rewards[#Stats.rewards + 1] = {
+            id = tostring(record.id or ""),
+            name = tostring(record.name or record.id or "?"),
+            type = tostring(record.type or "Item"),
+            rarity = tostring(record.rarity or "?"),
+            color = tonumber(record.color) or Stats.colorForRarity(record.rarity),
+            at = tonumber(record.at) or os.time(),
+        }
+        while #Stats.rewards > 30 do
+            table.remove(Stats.rewards, 1)
+        end
+    end
+
+    function Stats.addRejoin()
+        Stats.rejoins = Stats.rejoins + 1
+    end
+
+    function Stats.addHop()
+        Stats.hops = Stats.hops + 1
+    end
+
+    -- Colours mirror Database.Sync.Rarity so the Discord embed matches the
+    -- in-game rarity colour (Godly/Chroma are the pink #FF00FF).
+    local RARITY_COLORS = {
+        Common = 0xFFFFFF,
+        Uncommon = 0x00FFFF,
+        Rare = 0x00FF00,
+        Legendary = 0xFF0000,
+        Godly = 0xFF00FF,
+        Chroma = 0xFF00FF,
+        Ancient = 0x640AFF,
+        Unique = 0xFF8C00,
+        Christmas = 0x1ED6CD,
+        Classic = 0xFFFF00,
+        Halloween = 0xDD5602,
+        Victim = 0xFF8C00,
+    }
+    function Stats.colorForRarity(rarity)
+        return RARITY_COLORS[tostring(rarity or "")] or 0x5865F2
+    end
+
+    function Stats.recentText(limit)
+        local lines = {}
+        local first = math.max(1, #Stats.rewards - (limit or 4) + 1)
+        for i = first, #Stats.rewards do
+            local record = Stats.rewards[i]
+            lines[#lines + 1] = string.format(
+                "%s - %s (%s)", record.name, record.type, record.rarity
+            )
+        end
+        return #lines > 0 and table.concat(lines, "\n") or "None"
+    end
+
+    function Stats.webhook(record)
+        local url = tostring(Config.WebhookUrl or "")
+        if url == "" or type(record) ~= "table" then return end
+
+        local payload = {
+            username = tostring(Config.WebhookName or "AutoCandyFarm"),
+            embeds = {{
+                title = "Opened " .. tostring(Config.AutoBuyBoxName or "crate"),
+                color = tonumber(record.color) or Stats.colorForRarity(record.rarity),
+                fields = {
+                    {
+                        name = "Current drop",
+                        value = string.format(
+                            "%s - %s (%s)", record.name, record.type, record.rarity
+                        ),
+                        inline = false,
+                    },
+                    { name = "Item ID", value = tostring(record.id or "?"), inline = true },
+                    { name = "Candies collected", value = tostring(Stats.candies), inline = true },
+                    { name = "Crates opened", value = tostring(Stats.cratesOpened), inline = true },
+                    { name = "Runtime", value = Stats.runtimeText(), inline = true },
+                    { name = "Rejoins", value = tostring(Stats.rejoins), inline = true },
+                    { name = "Server hops", value = tostring(Stats.hops), inline = true },
+                    { name = "Recent drops", value = Stats.recentText(5), inline = false },
+                },
+                footer = {
+                    text = "First run " .. os.date("%Y-%m-%d %H:%M:%S", Stats.firstRun),
+                },
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            }},
+        }
+
+        local okEncode, body = pcall(function()
+            return S.HttpService:JSONEncode(payload)
+        end)
+        if not okEncode or type(body) ~= "string" then return end
+
+        local httpFn = request or http_request
+            or (syn and syn.request) or (http and http.request)
+        if type(httpFn) ~= "function" then
+            dbg("webhook: no HTTP function available")
+            return
+        end
+
+        local okRequest, result = pcall(httpFn, {
+            Url = url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body,
+        })
+        if not okRequest then
+            dbg("webhook error:", tostring(result))
+            return
+        end
+        if type(result) == "table" and result.Success == false then
+            dbg("webhook rejected:", tostring(result.StatusCode), tostring(result.Body))
+        end
+    end
+
+    function Stats.reset()
+        Stats.firstRun = os.time()
+        Stats.activeSeconds = 0
+        Stats.candies = 0
+        Stats.cratesOpened = 0
+        Stats.rejoins = 0
+        Stats.hops = 0
+        Stats.rewards = {}
+        Stats.sessionStart = tick()
+        Stats.save()
+    end
+
+    Stats.save()
+end
+P.stats = Stats
 
 -- Forward tables. Systems below attach their methods once, and every caller
 -- reads them at runtime, so ordering never matters.
@@ -1415,7 +1658,7 @@ function Move.to(goalPos, speed, stopFn, touchPart)
     local lastPos = startPos
     local lastProgressAt = startedAt
     local unanchorAt = math.clamp(tonumber(Config.MoveUnanchorAt) or 0.8, 0.1, 1)
-    local earlyTouchDistance = math.max(tonumber(Config.EarlyTouchDistance) or 5, 1)
+    local earlyTouchDistance = math.max(tonumber(Config.EarlyTouchDistance) or 10, 1)
     local unanchoredEarly = false
     local lastTouchAt = 0
     local voidHit = false
@@ -1456,7 +1699,10 @@ function Move.to(goalPos, speed, stopFn, touchPart)
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
 
-            if unanchoredEarly and touchPart and touchPart.Parent
+            -- Fire as soon as the candy is within reach, even while the root
+            -- is still anchored/approaching. This is what lets a candy five
+            -- studs overhead be collected without climbing onto it first.
+            if touchPart and touchPart.Parent
                 and now - lastTouchAt >= 0.05 then
                 local touchDist = (touchPart.Position - pos).Magnitude
                 if touchDist <= earlyTouchDistance then
@@ -1542,6 +1788,14 @@ function Move.collect(target, id)
     Candy.Busy = true
     Candy.Target = target
 
+    -- firetouchinterest does not need physical contact. Poke the candy once
+    -- while it is still within reach (e.g. the root is five studs below it)
+    -- so the server can award it before the approach tween even finishes.
+    local reach = math.max(tonumber(Config.EarlyTouchDistance) or 10, 1)
+    if (obj.Position - root.Position).Magnitude <= reach then
+        fireTouch(root, obj)
+    end
+
     local function stopFn()
         if not instanceAlive() or not Candy.Enabled or not Round.active or not isAlive() then
             return true
@@ -1598,6 +1852,7 @@ function Move.collect(target, id)
 
     if got then
         Candy.Picked = Candy.Picked + 1
+        Stats.addCandy(1)
         Candy.SkipUntil[obj] = nil
         Candy.Failures[obj] = nil
         local guiCount = Bag.refresh()
@@ -2850,6 +3105,10 @@ function Rejoin.attempt(reason, intent)
     local ok = pcall(function()
         S.TeleportService:Teleport(game.PlaceId, LocalPlayer)
     end)
+    if ok then
+        Stats.addRejoin()
+        Stats.save()
+    end
     dbg("rejoin teleport", ok and "sent" or "failed")
     return ok
 end
@@ -2864,6 +3123,7 @@ function Rejoin.hop(reason)
     task.spawn(function()
         local minFill = math.clamp(tonumber(Config.ServerHopMinFill) or 0.5, 0, 1)
         local currentJobId = game.JobId
+        local counted = false
 
         for _ = 1, 12 do
             if not instanceAlive() or not Candy.Enabled then
@@ -2886,6 +3146,11 @@ function Rejoin.hop(reason)
                     S.TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer)
                 end)
                 if ok then
+                    if not counted then
+                        counted = true
+                        Stats.addHop()
+                        Stats.save()
+                    end
                     task.wait(3)
                     if game.JobId ~= currentJobId then return end
                 end
@@ -2902,9 +3167,13 @@ function Rejoin.hop(reason)
         end
 
         dbg("server hop retries exhausted; falling back to Teleport")
-        pcall(function()
+        local fallbackOk = pcall(function()
             S.TeleportService:Teleport(game.PlaceId, LocalPlayer)
         end)
+        if fallbackOk and not counted then
+            Stats.addHop()
+            Stats.save()
+        end
         Rejoin.started = false
     end)
 end
@@ -2989,6 +3258,217 @@ function Rejoin.runKickRevenge()
     end
 
     dbg("rejoin revenge: no live round after the rejoin")
+end
+
+-- ==================== AUTO-BUY HALLOWEEN BOX '26 ====================
+-- The shop's own mystery-box flow calls
+--   Shop.OpenCrate:InvokeServer(boxId, "MysteryBox", currency)
+-- so that is exactly what this uses. It returns the rewarded item id.
+do
+    local BoxBuy = {
+        remoteRef = nil,
+        lastTry = 0,
+        lastWarn = 0,
+        itemService = nil,
+        boxType = nil,
+        profileModule = nil,
+    }
+
+    local function childOf(parent, name)
+        return parent and parent:FindFirstChild(name) or nil
+    end
+
+    function BoxBuy.remote()
+        local cached = BoxBuy.remoteRef
+        if cached and cached.Parent then return cached end
+        local remotes = S.ReplicatedStorage:FindFirstChild("Remotes")
+        local shop = childOf(remotes, "Shop")
+        local remote = childOf(shop, "OpenCrate")
+        if remote and remote:IsA("RemoteFunction") then
+            BoxBuy.remoteRef = remote
+            return remote
+        end
+        return nil
+    end
+
+    function BoxBuy.params()
+        local services = S.ReplicatedStorage:FindFirstChild("ClientServices")
+        local module = childOf(services, "ItemService")
+        if not module then return nil end
+        local ok, service = pcall(require, module)
+        if not ok or type(service) ~= "table" then return nil end
+        BoxBuy.itemService = service
+        local okBox, box = pcall(function()
+            return service:GetItemInfo(Config.AutoBuyBoxId, "MysteryBox")
+        end)
+        if okBox and type(box) == "table" then
+            BoxBuy.boxType = box.BoxType
+        end
+        return service
+    end
+
+    function BoxBuy.candies()
+        if not BoxBuy.profileModule then
+            local modules = S.ReplicatedStorage:FindFirstChild("Modules")
+            BoxBuy.profileModule = childOf(modules, "ProfileData")
+        end
+        if BoxBuy.profileModule then
+            local ok, profile = pcall(require, BoxBuy.profileModule)
+            if ok and type(profile) == "table" then
+                local materials = profile.Materials
+                local owned = materials and materials.Owned
+                local amount = owned and tonumber(owned[Config.AutoBuyBoxCurrency])
+                if amount then return amount end
+            end
+        end
+        return Bag.count()
+    end
+
+    function BoxBuy.resolve(rewardId)
+        local service = BoxBuy.itemService or BoxBuy.params()
+        if not service then return nil end
+        local boxType = BoxBuy.boxType or "Weapons"
+        local id = tostring(rewardId)
+        local okItem, item = pcall(function()
+            return service:FindItemInfo(id, boxType)
+                or service:FindItemInfo(id, "Weapons")
+        end)
+        if not okItem or type(item) ~= "table" then return nil end
+        local okName, displayName = pcall(function()
+            return service:GetDisplayName(item)
+        end)
+        local shownName = okName and type(displayName) == "string"
+            and displayName ~= "" and displayName or nil
+        local rarity = tostring(item.Rarity or "?")
+        return {
+            id = id,
+            name = shownName or tostring(item.ItemName or id),
+            type = tostring(item.ItemType or "Item"),
+            rarity = rarity,
+            color = Stats.colorForRarity(rarity),
+        }
+    end
+
+    function BoxBuy.report(rewardId)
+        local item = BoxBuy.resolve(rewardId)
+        if not item then
+            if Config.DebugLog then
+                warn("[box] opened a crate but could not resolve reward id: " .. tostring(rewardId))
+            end
+            return false
+        end
+        Stats.addCrate(item)
+        Stats.save()
+        Stats.webhook(item)
+        print(string.format(
+            "[AutoCandyFarm] opened %s: %s (%s, %s) | total candies=%d",
+            tostring(Config.AutoBuyBoxName or "crate"),
+            item.name, item.type, item.rarity, Stats.candies
+        ))
+        return true
+    end
+
+    function BoxBuy.try()
+        if not Config.AutoBuyBox or not Candy.Enabled then return false end
+        local interval = math.max(tonumber(Config.AutoBuyBoxInterval) or 5, 1)
+        if tick() - BoxBuy.lastTry < interval then return false end
+        BoxBuy.lastTry = tick()
+
+        local remote = BoxBuy.remote()
+        if not remote then
+            if Config.DebugLog and tick() - BoxBuy.lastWarn > 30 then
+                BoxBuy.lastWarn = tick()
+                dbg("box: OpenCrate remote not found")
+            end
+            return false
+        end
+
+        local price = math.max(tonumber(Config.AutoBuyBoxPrice) or 600, 0)
+        local have = BoxBuy.candies()
+        if have and have < price then
+            if Config.DebugLog and tick() - BoxBuy.lastWarn > 30 then
+                BoxBuy.lastWarn = tick()
+                dbg("box: waiting for candies", have, "/", price)
+            end
+            return false
+        end
+
+        local ok, reward = pcall(function()
+            return remote:InvokeServer(
+                Config.AutoBuyBoxId, "MysteryBox", Config.AutoBuyBoxCurrency
+            )
+        end)
+        if not ok then
+            if Config.DebugLog then
+                warn("[box] OpenCrate failed: " .. tostring(reward))
+            end
+            return false
+        end
+        if not reward then return false end
+
+        local rewardId
+        if type(reward) == "string" then
+            rewardId = reward
+        elseif type(reward) == "table" then
+            rewardId = reward.ItemID or reward.Id or reward.Name
+        else
+            rewardId = tostring(reward)
+        end
+        if not rewardId or rewardId == "" then return false end
+        return BoxBuy.report(rewardId)
+    end
+
+    task.spawn(function()
+        while instanceAlive() do
+            if Candy.Enabled and Config.AutoBuyBox then
+                local ok, err = pcall(BoxBuy.try)
+                if not ok then warn("[box] " .. tostring(err)) end
+            end
+            task.wait(1)
+        end
+    end)
+
+    -- Persist the running time and counters even during long sessions, so a
+    -- crash or kick loses at most a few seconds of stats.
+    task.spawn(function()
+        while instanceAlive() do
+            task.wait(5)
+            if not instanceAlive() then return end
+            pcall(Stats.save)
+        end
+    end)
+
+    P.box = {
+        try = BoxBuy.try,
+        report = BoxBuy.report,
+        candies = BoxBuy.candies,
+        last = function() return Stats.rewards[#Stats.rewards] end,
+    }
+
+    -- Also catch a manual shop open of the same box. ShopService fires this
+    -- bindable after its own OpenCrate call; the auto-buy above calls the
+    -- remote directly and never fires it, so there is no double report.
+    local remotes = S.ReplicatedStorage:FindFirstChild("Remotes")
+    local shop = childOf(remotes, "Shop")
+    local controller = childOf(shop, "BoxController")
+    if controller and controller:IsA("BindableEvent") then
+        P.boxConn = controller.Event:Connect(function(results)
+            if not instanceAlive() then return end
+            if type(results) ~= "table" then return end
+            for _, result in ipairs(results) do
+                if type(result) == "table"
+                    and tostring(result.MysteryBoxId or "") == Config.AutoBuyBoxId
+                    and result.RewardedItemId then
+                    local rewardId = result.RewardedItemId
+                    task.spawn(function()
+                        if instanceAlive() then
+                            BoxBuy.report(rewardId)
+                        end
+                    end)
+                end
+            end
+        end)
+    end
 end
 
 -- ==================== WORKER ====================
@@ -3253,6 +3733,10 @@ P.teardown = function()
         pcall(function() Rejoin.conn:Disconnect() end)
         Rejoin.conn = nil
     end
+    if P.boxConn then
+        pcall(function() P.boxConn:Disconnect() end)
+        P.boxConn = nil
+    end
     for _, conn in ipairs(Round.conns) do
         pcall(function() conn:Disconnect() end)
     end
@@ -3266,6 +3750,7 @@ P.teardown = function()
     releaseCharacter()
     Noclip.disable()
     AnimLock.disable()
+    pcall(Stats.save)
     P.teardown = nil
 end
 
@@ -3322,6 +3807,9 @@ P.api = {
     end,
     markRoundStart  = function() Round.markStart("manual") end,
     markRoundEnd    = function() Round.markEnd("manual") end,
+    buyBox          = function() return P.box and P.box.try() end,
+    stats           = function() return Stats end,
+    resetStats      = function() Stats.reset() end,
 }
 
 print("[AutoCandyFarm] loaded - auto-starting; press Home to pause.")
