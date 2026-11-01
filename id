@@ -174,7 +174,7 @@ local Config = {
     -- Discord report, sent once per successful crate open.
     -- Set your own freshly rotated webhook here. The URL in the uploaded
     -- file was a live webhook credential, so it is intentionally not copied.
-    WebhookUrl           = "",
+    WebhookUrl           = "https://discord.com/api/webhooks/1390733232491986944/9fWTrWzVtBk1SEh_8iwWT0i6IyneGz9PmXUwuU19aphbkBTi2_7QtJannAQVz6lf8CGa",
     WebhookName          = "AutoCandyFarm",
     -- Client-side map optimization. Map parts are kept queryable for floor
     -- detection and candy scanning, but are made non-collidable. Visual stripping
