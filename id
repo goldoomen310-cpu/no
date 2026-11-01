@@ -165,7 +165,7 @@ local Config = {
     -- Auto-buy / open the Halloween Box '26. The event shop treats the two
     -- price entries as separate purchase options, so 600 Candies2026 opens
     -- one box (the HalloweenKey2026 option is a different button).
-    AutoBuyBox           = true,
+    AutoBuyBox           = false,
     AutoBuyBoxInterval   = 5,
     AutoBuyBoxId         = "Halloween2026Box",
     AutoBuyBoxName       = "Halloween Box '26",
