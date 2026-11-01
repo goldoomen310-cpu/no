@@ -118,10 +118,10 @@ local Config = {
     AutoStart            = true,
     -- Candy
     CandyCap             = 50,
-    CandyCacheTTL        = 0.5,
+    CandyCacheTTL        = 0.5, -- used by non-forced checks; target selection always forces a fresh scan
     CandyMaxDistance     = 20000,
     TweenSpeed           = 25,
-    PathCandidates       = 5,
+    PathCandidates       = 12,
     PathPickupOverhead   = 0.035,
     PickupConfirmTime    = 0.025,
     KillerIgnoreRadius   = 10,
@@ -140,9 +140,10 @@ local Config = {
     SyncShotInterval     = 0.08,
     MissRetryDelay       = 4,
     -- Hiding
-    -- Hiding is disabled because the performance mode strips map visuals.
-    -- The character is never anchored by the collector or hide system.
-    HideUnderMap         = false,
+    -- Hide the character beneath the verified map floor whenever the farm is idle.
+    -- The hide system remains unanchored and restores the saved surface position
+    -- before collection or combat takes control of the character.
+    HideUnderMap         = true,
     HideDepth            = 120,
     HideMinFloorClearance = 20,
     HideMinDepth         = 15,
@@ -175,9 +176,10 @@ local Config = {
     -- file was a live webhook credential, so it is intentionally not copied.
     WebhookUrl           = "",
     WebhookName          = "AutoCandyFarm",
-    -- Client-only visual stripping; it does not remove server-side players or map data.
-    -- Collision surfaces and candy containers
-    -- are preserved so unanchored movement and collection keep working.
+    -- Client-side map optimization. Map parts are kept queryable for floor
+    -- detection and candy scanning, but are made non-collidable. Visual stripping
+    -- remains separate from collision handling.
+    DisableMapCollision  = true,
     DestroyMapVisuals    = true,
     RemovePlayerModels   = true,
     Disable3DRendering   = true,
@@ -735,6 +737,8 @@ local Performance = {
     playerAddedConn = nil,
     playerRemovingConn = nil,
     playerConns = {},
+    mapCollisionConns = setmetatable({}, { __mode = "k" }),
+    savedMapCollision = setmetatable({}, { __mode = "k" }),
     seenParts = setmetatable({}, { __mode = "k" }),
 }
 
@@ -788,24 +792,45 @@ function Performance.cleanPlayer(player, character)
 end
 
 function Performance.cleanMapPart(part)
-    if not Config.DestroyMapVisuals or not part or not part.Parent then return end
+    if not part or not part.Parent then return end
+    if not Config.DisableMapCollision and not Config.DestroyMapVisuals then return end
     if Performance.seenParts[part] then return end
-    if Performance.isCandyRelated(part) then return end
+    local candyRelated = Performance.isCandyRelated(part)
 
     local player = Performance.playerForDescendant(part)
     if player then return end
     if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return end
 
     Performance.seenParts[part] = true
-    if part.CanCollide then
-        -- Keep collision geometry but remove its visual cost.
+
+    -- Disable collision on map geometry without changing CanQuery or CanTouch.
+    -- Keeping CanQuery intact is important because Hide.floorAt uses raycasts
+    -- to verify a safe surface before moving the character under the map.
+    if Config.DisableMapCollision then
+        Performance.savedMapCollision[part] = part.CanCollide
+        pcall(function() part.CanCollide = false end)
+
+        if not Performance.mapCollisionConns[part] then
+            local ok, conn = pcall(function()
+                return part:GetPropertyChangedSignal("CanCollide"):Connect(function()
+                    if Performance.started and Config.DisableMapCollision
+                        and part.Parent and part.CanCollide then
+                        pcall(function() part.CanCollide = false end)
+                    end
+                end)
+            end)
+            if ok and conn then Performance.mapCollisionConns[part] = conn end
+        end
+    end
+
+    -- Candy parts stay visible and queryable so the scanner/touch logic can
+    -- still find them, but they also become non-collidable like the map.
+    if Config.DestroyMapVisuals and not candyRelated then
         pcall(function()
             part.Transparency = 1
             part.LocalTransparencyModifier = 1
             part.CastShadow = false
         end)
-    else
-        pcall(function() part:Destroy() end)
     end
 end
 
@@ -852,7 +877,7 @@ function Performance.start()
         pcall(function() RunService:Set3dRenderingEnabled(false) end)
     end
 
-    if Config.DestroyMapVisuals then
+    if Config.DestroyMapVisuals or Config.DisableMapCollision then
         Performance.worldConn = Workspace.DescendantAdded:Connect(function(descendant)
             if not descendant:IsA("BasePart") then return end
             task.defer(function()
@@ -896,6 +921,17 @@ function Performance.stop()
         if conn then pcall(function() conn:Disconnect() end) end
         Performance.playerConns[player] = nil
     end
+    for part, conn in pairs(Performance.mapCollisionConns) do
+        if conn then pcall(function() conn:Disconnect() end) end
+        Performance.mapCollisionConns[part] = nil
+    end
+    for part, canCollide in pairs(Performance.savedMapCollision) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = canCollide end)
+        end
+        Performance.savedMapCollision[part] = nil
+    end
+    Performance.seenParts = setmetatable({}, { __mode = "k" })
     if Config.Disable3DRendering then
         pcall(function() RunService:Set3dRenderingEnabled(true) end)
     end
@@ -1208,12 +1244,18 @@ function Hide.unhideForCandy(target)
 end
 
 function Hide.resetRound()
+    -- A round can begin while the character is hidden during the lobby. Restore
+    -- the saved surface position before clearing the previous round's hide data.
+    if Hide.active then
+        Hide.unhide()
+    else
+        Hide.clear()
+    end
     Hide.hideDeaths = 0
     Hide.voidRecoveries = 0
     Hide.blockedUntil = 0
     Hide.surfaceY = nil
     Hide.lastSafeCF = nil
-    Hide.clear()
 end
 
 -- Always-on watchdog: rescues the body if it ever drops toward the destroy
@@ -1903,7 +1945,7 @@ do
         local currentBag = Bag.refresh() or Candy.Collected or 0
         local remaining = math.max(1, bagTarget() - currentBag)
         local routeLimit = math.min(remaining, #pool)
-        local candidateLimit = math.clamp(math.floor(tonumber(Config.PathCandidates) or 5), 1, 5)
+        local candidateLimit = math.clamp(math.floor(tonumber(Config.PathCandidates) or 12), 1, 16)
         local candidateCount = math.min(candidateLimit, #pool)
         local speed = getTweenSpeed()
         local pickupOverhead = math.max(tonumber(Config.PathPickupOverhead) or 0.035, 0)
@@ -3119,27 +3161,18 @@ end
 -- ==================== FARM LOOP ====================
 local Farm = {}
 local function nextPlannedTarget()
-    local plan = Candy.Plan
+    -- Never consume the remainder of an old route blindly. Candies can be
+    -- collected by other players, spawn/despawn, or become unsafe while we
+    -- travel. Rebuild the candidate list from Workspace and calculate a fresh
+    -- route from the character's current position for every target decision.
     local root = getRoot()
-    if not plan or plan.serial ~= Round.serial or type(plan.route) ~= "table" or not root then
+    if not root then
+        Candy.Plan = nil
         return nil
     end
 
-    while plan.route[1] do
-        local obj = plan.route[1]
-        local blockedUntil = Candy.SkipUntil[obj]
-        if Scan.available(obj) and (not blockedUntil or blockedUntil <= tick()) and Scan.safe(obj) then
-            return {
-                obj = obj,
-                pos = obj.Position,
-                dist = (obj.Position - root.Position).Magnitude,
-            }
-        end
-        table.remove(plan.route, 1)
-    end
-
-    Candy.Plan = nil
-    return nil
+    local freshList = Scan.list(true)
+    return Scan.best(freshList)
 end
 
 function Farm.run(id)
@@ -3174,12 +3207,10 @@ function Farm.run(id)
             return "full"
         end
 
-        local list = Scan.list(false)
-        local target = nextPlannedTarget()
-        local waitHint
-        if not target then
-            target, waitHint = Scan.best(list)
-        end
+        -- Full rescan + route rebuild on every iteration. After each pickup,
+        -- failed approach, or changed target, the next pass sees the current
+        -- map instead of following stale entries from the previous route.
+        local target, waitHint = nextPlannedTarget()
         if not target then
             if waitHint then
                 -- Every safe candy is cooling down after a failed pickup.
