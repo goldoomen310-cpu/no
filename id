@@ -29,7 +29,6 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-local TweenService = game:GetService("TweenService")
 local S = {
     UserInputService = game:GetService("UserInputService"),
     ReplicatedStorage = game:GetService("ReplicatedStorage"),
@@ -121,7 +120,10 @@ local Config = {
     CandyCap             = 50,
     CandyCacheTTL        = 0.5,
     CandyMaxDistance     = 20000,
-    TweenSpeed           = 25,
+    TweenSpeed           = 70,
+    PathCandidates       = 5,
+    PathPickupOverhead   = 0.035,
+    PickupConfirmTime    = 0.025,
     KillerIgnoreRadius   = 10,
     KillerIgnoreHeight   = 10,
     -- Combat
@@ -138,18 +140,18 @@ local Config = {
     SyncShotInterval     = 0.08,
     MissRetryDelay       = 4,
     -- Hiding
-    HideUnderMap         = true,
+    -- Hiding is disabled because the performance mode strips map visuals.
+    -- The character is never anchored by the collector or hide system.
+    HideUnderMap         = false,
     HideDepth            = 120,
     HideMinFloorClearance = 20,
     HideMinDepth         = 15,
     HideMaxDepth         = 250,
     -- Movement
     Noclip               = true,
-    MoveUnanchorAt       = 0.8,
     -- Simulated touches are fired as soon as a candy is within this many
     -- studs (3D distance), so a candy ~5 studs overhead is still collected.
     EarlyTouchDistance   = 10,
-    PickupFinishTime     = 0.12,
     -- Rejoin / hop
     AutoRejoin           = true,
     AutoRejoinNoRoundTimeout = 130,
@@ -169,8 +171,17 @@ local Config = {
     AutoBuyBoxCurrency   = "Candies2026",
     AutoBuyBoxPrice      = 600,
     -- Discord report, sent once per successful crate open.
-    WebhookUrl           = "https://discord.com/api/webhooks/1390733232491986944/9fWTrWzVtBk1SEh_8iwWT0i6IyneGz9PmXUwuU19aphbkBTi2_7QtJannAQVz6lf8CGa",
+    -- Set your own freshly rotated webhook here. The URL in the uploaded
+    -- file was a live webhook credential, so it is intentionally not copied.
+    WebhookUrl           = "",
     WebhookName          = "AutoCandyFarm",
+    -- Client-only visual stripping; it does not remove server-side players or map data.
+    -- Collision surfaces and candy containers
+    -- are preserved so unanchored movement and collection keep working.
+    DestroyMapVisuals    = true,
+    RemovePlayerModels   = true,
+    Disable3DRendering   = true,
+    ShowStatsHUD         = true,
 }
 
 local Candy = P.candy
@@ -208,14 +219,22 @@ if type(P.teardown) == "function" then
 end
 
 -- ==================== PERSISTENT STATS + DISCORD WEBHOOK ====================
--- The executor environment is recreated on a rejoin or server hop, so these
--- counters live in a workspace file instead of getgenv. They start at the
--- first execution and are only reset through P.api.resetStats().
+-- Counters survive queued rejoins/server hops. A normal manual execution
+-- starts a fresh runtime session instead of inheriting an old saved runtime.
+local queuedResume = false
+do
+    local pending = genv.__mm2candy_rejoin
+    if type(pending) == "table" then
+        local age = os.time() - (tonumber(pending.at) or 0)
+        queuedResume = pending.resumeStats == true and age >= 0 and age <= 300
+    end
+end
 local Stats = {
     path = "AutoCandyFarm/stats.json",
     firstRun = os.time(),
     activeSeconds = 0,
     candies = 0,
+    sessionCandies = 0,
     cratesOpened = 0,
     rejoins = 0,
     hops = 0,
@@ -243,6 +262,8 @@ do
         Stats.firstRun = tonumber(saved.firstRun) or Stats.firstRun
         Stats.activeSeconds = math.max(0, tonumber(saved.activeSeconds) or 0)
         Stats.candies = math.max(0, tonumber(saved.candies) or 0)
+        Stats.sessionCandies = queuedResume
+            and math.max(0, tonumber(saved.sessionCandies) or 0) or 0
         Stats.cratesOpened = math.max(0, tonumber(saved.cratesOpened) or 0)
         Stats.rejoins = math.max(0, tonumber(saved.rejoins) or 0)
         Stats.hops = math.max(0, tonumber(saved.hops) or 0)
@@ -259,6 +280,11 @@ do
                 end
             end
         end
+    end
+    if not queuedResume then
+        Stats.firstRun = os.time()
+        Stats.activeSeconds = 0
+        Stats.sessionCandies = 0
     end
     Stats.sessionStart = tick()
 
@@ -282,11 +308,19 @@ do
 
     function Stats.save()
         if type(writefile) ~= "function" then return false end
+        if type(makefolder) == "function" then
+            pcall(function()
+                if type(isfolder) ~= "function" or not isfolder("AutoCandyFarm") then
+                    makefolder("AutoCandyFarm")
+                end
+            end)
+        end
         local snapshot = {
             version = 1,
             firstRun = Stats.firstRun,
             activeSeconds = Stats.runtime(),
             candies = Stats.candies,
+            sessionCandies = Stats.sessionCandies,
             cratesOpened = Stats.cratesOpened,
             rejoins = Stats.rejoins,
             hops = Stats.hops,
@@ -302,7 +336,9 @@ do
     end
 
     function Stats.addCandy(amount)
-        Stats.candies = math.max(0, Stats.candies + (tonumber(amount) or 1))
+        local n = math.max(0, tonumber(amount) or 1)
+        Stats.candies = Stats.candies + n
+        Stats.sessionCandies = Stats.sessionCandies + n
     end
 
     function Stats.addCrate(record)
@@ -424,6 +460,7 @@ do
         Stats.firstRun = os.time()
         Stats.activeSeconds = 0
         Stats.candies = 0
+        Stats.sessionCandies = 0
         Stats.cratesOpened = 0
         Stats.rejoins = 0
         Stats.hops = 0
@@ -457,10 +494,14 @@ local Motion = {
     lockUntil   = 0,
 }
 function Motion.cancelTween()
-    if Motion.tween then
-        pcall(function() Motion.tween:Cancel() end)
-        Motion.tween = nil
+    local active = Motion.tween
+    if not active then return end
+    if type(active) == "table" then
+        active.cancelled = true
+    else
+        pcall(function() active:Cancel() end)
     end
+    Motion.tween = nil
 end
 function Motion.busy()
     return Motion.shooting or Motion.teleporting
@@ -561,6 +602,280 @@ function Bag.full()
     local guiCount = Bag.refresh()
     if guiCount then return guiCount >= bagTarget() end
     return Candy.Collected >= bagTarget()
+end
+
+
+-- ==================== STATS HUD ====================
+local Hud = { gui = nil, label = nil, conn = nil, lastUpdate = 0, lastSave = 0 }
+function Hud.update(force)
+    if not Hud.label or not Hud.label.Parent then return end
+    local now = tick()
+    if not force and now - Hud.lastUpdate < 0.75 then return end
+    Hud.lastUpdate = now
+
+    local current = Bag.refresh() or Candy.Collected or 0
+    local runtime = Stats.runtime()
+    local hours = runtime / 3600
+    local candiesPerHour = hours > 0 and (Stats.sessionCandies / hours) or 0
+    Hud.label.Text = string.format(
+        "Candies: %d/%d\nRuntime: %s\nTotal candies: %d\nCrates opened: %d\nRejoins: %d\nServer hops: %d\nCandies/hour: %.1f",
+        math.max(0, tonumber(current) or 0), bagTarget(), Stats.runtimeText(),
+        Stats.candies, Stats.cratesOpened, Stats.rejoins, Stats.hops, candiesPerHour
+    )
+
+    if now - Hud.lastSave >= 10 then
+        Hud.lastSave = now
+        Stats.save()
+    end
+end
+
+function Hud.start()
+    if not Config.ShowStatsHUD then return end
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        or LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+
+    local old = playerGui:FindFirstChild("AutoCandyFarmHUD")
+    if old then pcall(function() old:Destroy() end) end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AutoCandyFarmHUD"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 1000
+
+    local frame = Instance.new("Frame")
+    frame.Name = "StatsPanel"
+    frame.AnchorPoint = Vector2.new(0, 0)
+    frame.Position = UDim2.new(0, 12, 0, 58)
+    frame.Size = UDim2.fromOffset(238, 156)
+    frame.BackgroundColor3 = Color3.fromRGB(17, 19, 25)
+    frame.BackgroundTransparency = 0.12
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(95, 105, 125)
+    stroke.Transparency = 0.35
+    stroke.Thickness = 1
+    stroke.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Name = "StatsText"
+    label.BackgroundTransparency = 1
+    label.Position = UDim2.fromOffset(11, 9)
+    label.Size = UDim2.new(1, -22, 1, -18)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13
+    label.TextColor3 = Color3.fromRGB(242, 244, 248)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
+    label.TextWrapped = false
+    label.RichText = false
+    label.Parent = frame
+
+    gui.Parent = playerGui
+    Hud.gui = gui
+    Hud.label = label
+    Hud.update(true)
+
+    if Hud.conn then Hud.conn:Disconnect() end
+    Hud.conn = RunService.Heartbeat:Connect(function()
+        if not instanceAlive() then return end
+        Hud.update(false)
+    end)
+end
+
+function Hud.stop()
+    if Hud.conn then
+        pcall(function() Hud.conn:Disconnect() end)
+        Hud.conn = nil
+    end
+    if Hud.gui then
+        pcall(function() Hud.gui:Destroy() end)
+        Hud.gui = nil
+    end
+    Hud.label = nil
+end
+
+-- ==================== CLIENT PERFORMANCE STRIPPING ====================
+-- This affects only this client. Decorative/non-collidable map parts are
+-- destroyed; collidable map parts are made invisible rather than deleted so
+-- the unanchored character still has floors and walls for physics.
+local Performance = {
+    started = false,
+    worldConn = nil,
+    playerAddedConn = nil,
+    playerRemovingConn = nil,
+    playerConns = {},
+    seenParts = setmetatable({}, { __mode = "k" }),
+}
+
+function Performance.isCandyRelated(obj)
+    if not obj then return false end
+    local name = tostring(obj.Name or ""):lower()
+    if name:find("candy", 1, true) or name:find("candie", 1, true) then
+        return true
+    end
+    if obj:GetAttribute("CoinID") == "Candy" then return true end
+    local cursor = obj
+    while cursor and cursor ~= Workspace do
+        if cursor.Name == "CoinContainer" then return true end
+        cursor = cursor.Parent
+    end
+    return false
+end
+
+function Performance.playerForDescendant(obj)
+    for _, player in ipairs(Players:GetPlayers()) do
+        local character = player.Character
+        if character and (obj == character or obj:IsDescendantOf(character)) then
+            return player, character
+        end
+    end
+    return nil, nil
+end
+
+function Performance.cleanPlayer(player, character)
+    if not Config.RemovePlayerModels or player == LocalPlayer or not character then return end
+    for _, descendant in ipairs(character:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            local tool = descendant:FindFirstAncestorOfClass("Tool")
+            if tool then
+                descendant.LocalTransparencyModifier = 1
+                descendant.CastShadow = false
+            elseif descendant.Name == "HumanoidRootPart" then
+                descendant.Transparency = 1
+                descendant.LocalTransparencyModifier = 1
+                descendant.CastShadow = false
+            else
+                pcall(function() descendant:Destroy() end)
+            end
+        elseif descendant:IsA("Accessory") or descendant:IsA("Clothing")
+            or descendant:IsA("Decal") or descendant:IsA("Texture") then
+            if not descendant:FindFirstAncestorOfClass("Tool") then
+                pcall(function() descendant:Destroy() end)
+            end
+        end
+    end
+end
+
+function Performance.cleanMapPart(part)
+    if not Config.DestroyMapVisuals or not part or not part.Parent then return end
+    if Performance.seenParts[part] then return end
+    if Performance.isCandyRelated(part) then return end
+
+    local player = Performance.playerForDescendant(part)
+    if player then return end
+    if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return end
+
+    Performance.seenParts[part] = true
+    if part.CanCollide then
+        -- Keep collision geometry but remove its visual cost.
+        pcall(function()
+            part.Transparency = 1
+            part.LocalTransparencyModifier = 1
+            part.CastShadow = false
+        end)
+    else
+        pcall(function() part:Destroy() end)
+    end
+end
+
+function Performance.watchPlayer(player)
+    if player == LocalPlayer or Performance.playerConns[player] then return end
+    local ok, conn = pcall(function()
+        return player.CharacterAdded:Connect(function(character)
+            task.delay(0.15, function()
+                if Performance.started and character and character.Parent then
+                    Performance.cleanPlayer(player, character)
+                end
+            end)
+        end)
+    end)
+    if ok and conn then Performance.playerConns[player] = conn end
+    if player.Character then
+        task.defer(function()
+            if Performance.started then Performance.cleanPlayer(player, player.Character) end
+        end)
+    end
+end
+
+function Performance.cleanWorld()
+    if not Performance.started then return end
+    for _, descendant in ipairs(Workspace:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            Performance.cleanMapPart(descendant)
+        end
+    end
+    if Config.RemovePlayerModels then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character then
+                Performance.cleanPlayer(player, player.Character)
+            end
+        end
+    end
+end
+
+function Performance.start()
+    if Performance.started then return end
+    Performance.started = true
+
+    if Config.Disable3DRendering then
+        pcall(function() RunService:Set3dRenderingEnabled(false) end)
+    end
+
+    if Config.DestroyMapVisuals then
+        Performance.worldConn = Workspace.DescendantAdded:Connect(function(descendant)
+            if not descendant:IsA("BasePart") then return end
+            task.defer(function()
+                if Performance.started and descendant.Parent then
+                    Performance.cleanMapPart(descendant)
+                end
+            end)
+        end)
+    end
+
+    if Config.RemovePlayerModels then
+        for _, player in ipairs(Players:GetPlayers()) do
+            Performance.watchPlayer(player)
+        end
+        Performance.playerAddedConn = Players.PlayerAdded:Connect(Performance.watchPlayer)
+        Performance.playerRemovingConn = Players.PlayerRemoving:Connect(function(player)
+            local conn = Performance.playerConns[player]
+            if conn then pcall(function() conn:Disconnect() end) end
+            Performance.playerConns[player] = nil
+        end)
+    end
+
+    task.defer(Performance.cleanWorld)
+end
+
+function Performance.stop()
+    Performance.started = false
+    if Performance.worldConn then
+        pcall(function() Performance.worldConn:Disconnect() end)
+        Performance.worldConn = nil
+    end
+    if Performance.playerAddedConn then
+        pcall(function() Performance.playerAddedConn:Disconnect() end)
+        Performance.playerAddedConn = nil
+    end
+    if Performance.playerRemovingConn then
+        pcall(function() Performance.playerRemovingConn:Disconnect() end)
+        Performance.playerRemovingConn = nil
+    end
+    for player, conn in pairs(Performance.playerConns) do
+        if conn then pcall(function() conn:Disconnect() end) end
+        Performance.playerConns[player] = nil
+    end
+    if Config.Disable3DRendering then
+        pcall(function() RunService:Set3dRenderingEnabled(true) end)
+    end
 end
 
 -- ==================== UNDER-MAP HIDE (VOID-SAFE) ====================
@@ -796,9 +1111,7 @@ function Hide.hide()
     local hum = getHumanoid()
     Hide.health = hum and hum.Health or nil
 
-    -- Anchoring removes the gravity-vs-heartbeat race entirely, so a throttled
-    -- client can never fall from the hide point into the destroy plane.
-    root.Anchored = true
+    root.Anchored = false
     root.CFrame = cf
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
@@ -859,7 +1172,7 @@ function Hide.hold()
     end
 
     if Hide.cf then
-        root.Anchored = true
+        root.Anchored = false
         root.CFrame = Hide.cf
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
@@ -1524,34 +1837,32 @@ do
     function Scan.best(list)
         local root = getRoot()
         if not root then return nil end
+
         local origin = (Hide.active and Hide.savedCF) and Hide.savedCF.Position or root.Position
         local now = tick()
         local killerPos = Killer.pos()
-        local best, bestDist, bestKey
+        local pool = {}
         local soonestBlocked = math.huge
 
-        for _, c in ipairs(list) do
-            local obj = c.obj
-            if available(obj) and Scan.safeAt(obj, killerPos) then
+        for _, entry in ipairs(list) do
+            local obj = entry.obj
+            if available(obj) then
                 local blockedUntil = Candy.SkipUntil[obj]
                 if blockedUntil and blockedUntil > now then
-                    if blockedUntil < soonestBlocked then soonestBlocked = blockedUntil end
-                else
-                    local pos = obj.Position
-                    local dist = (pos - origin).Magnitude
-                    local k = key(obj)
-                    if not best
-                        or dist < bestDist
-                        or (dist == bestDist and k < bestKey) then
-                        best = { obj = obj, pos = pos, dist = dist, key = k }
-                        bestDist = dist
-                        bestKey = k
+                    if blockedUntil < soonestBlocked then
+                        soonestBlocked = blockedUntil
                     end
+                elseif Scan.safeAt(obj, killerPos) then
+                    pool[#pool + 1] = {
+                        obj = obj,
+                        pos = obj.Position,
+                        key = key(obj),
+                    }
                 end
             end
         end
 
-        if not best then
+        if #pool == 0 then
             Candy.Plan = nil
             if soonestBlocked < math.huge then
                 return nil, math.max(0.05, soonestBlocked - now)
@@ -1559,13 +1870,97 @@ do
             return nil
         end
 
+        table.sort(pool, function(a, b)
+            local da = (a.pos - origin).Magnitude
+            local db = (b.pos - origin).Magnitude
+            if da == db then return a.key < b.key end
+            return da < db
+        end)
+
+        local currentBag = Bag.refresh() or Candy.Collected or 0
+        local remaining = math.max(1, bagTarget() - currentBag)
+        local routeLimit = math.min(remaining, #pool)
+        local candidateLimit = math.clamp(math.floor(tonumber(Config.PathCandidates) or 5), 1, 5)
+        local candidateCount = math.min(candidateLimit, #pool)
+        local speed = math.max(tonumber(Candy.TweenSpeed) or Config.TweenSpeed, 1)
+        local pickupOverhead = math.max(tonumber(Config.PathPickupOverhead) or 0.035, 0)
+        local candidates = {}
+        local bestPlan, bestScore
+
+        -- Each candidate begins at a different one of the five closest candies.
+        -- The remainder is a greedy nearest-neighbour route built before moving.
+        for seedIndex = 1, candidateCount do
+            local used = {}
+            local route = {}
+            local current = pool[seedIndex]
+            local currentPos = origin
+            local totalDistance = 0
+
+            while current and #route < routeLimit do
+                used[current.obj] = true
+                route[#route + 1] = current.obj
+                totalDistance = totalDistance + (current.pos - currentPos).Magnitude
+                currentPos = current.pos
+
+                local nextEntry, nextDistance
+                for _, option in ipairs(pool) do
+                    if not used[option.obj] then
+                        local distance = (option.pos - currentPos).Magnitude
+                        if not nextDistance or distance < nextDistance
+                            or (distance == nextDistance and option.key < nextEntry.key) then
+                            nextEntry = option
+                            nextDistance = distance
+                        end
+                    end
+                end
+                current = nextEntry
+            end
+
+            local estimatedTime = (totalDistance / speed) + (#route * pickupOverhead)
+            local score = #route / math.max(estimatedTime, 0.001)
+            local candidate = {
+                first = route[1],
+                count = #route,
+                distance = totalDistance,
+                estimatedTime = estimatedTime,
+                speed = speed,
+                candiesPerSecond = score,
+                route = route,
+            }
+            candidates[#candidates + 1] = candidate
+
+            if not bestPlan or score > bestScore
+                or (score == bestScore and estimatedTime < bestPlan.estimatedTime) then
+                bestPlan = candidate
+                bestScore = score
+            end
+        end
+
+        if not bestPlan or not bestPlan.route[1] then
+            Candy.Plan = nil
+            return nil
+        end
+
         Candy.Plan = {
-            first = best.obj,
-            count = 1,
-            distance = best.dist,
-            route = { best.obj },
+            first = bestPlan.route[1],
+            count = bestPlan.count,
+            distance = bestPlan.distance,
+            estimatedTime = bestPlan.estimatedTime,
+            speed = bestPlan.speed,
+            candiesPerSecond = bestPlan.candiesPerSecond,
+            candidates = candidates,
+            route = bestPlan.route,
+            serial = Round.serial,
+            createdAt = now,
         }
-        return best
+
+        local first = bestPlan.route[1]
+        return {
+            obj = first,
+            pos = first.Position,
+            dist = (first.Position - origin).Magnitude,
+            key = key(first),
+        }
     end
 
     function Scan.markFailure(obj)
@@ -1610,8 +2005,10 @@ function Move.to(goalPos, speed, stopFn, touchPart)
     if not root then return false end
     local charAtStart = LocalPlayer.Character
 
-    speed = math.max(tonumber(speed) or 1, 1)
-    local startPos = root.Position
+    speed = math.max(tonumber(speed) or Config.TweenSpeed or 1, 1)
+    local startCF = root.CFrame
+    local startPos = startCF.Position
+    local rotation = startCF.Rotation
     local initialDistance = (goalPos - startPos).Magnitude
     if initialDistance < 0.05 then return true end
 
@@ -1620,129 +2017,104 @@ function Move.to(goalPos, speed, stopFn, touchPart)
     local autoRotate = hum and hum.AutoRotate
     if hum then hum.AutoRotate = false end
 
-    root.Anchored = true
-    local originalGravity = Workspace.Gravity
-    local goalCF = CFrame.new(goalPos) * root.CFrame.Rotation
-    local duration = math.max(initialDistance / speed, 0.01)
-
-    Workspace.Gravity = 0
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
-
-    local tween
-    local okCreate = pcall(function()
-        tween = TweenService:Create(
-            root,
-            TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, 0, false, 0),
-            { CFrame = goalCF }
-        )
-    end)
-    if not okCreate or not tween then
-        Workspace.Gravity = originalGravity
-        if root and root.Parent then root.Anchored = false end
-        if hum and hum.Parent and autoRotate ~= nil then hum.AutoRotate = autoRotate end
-        dbg("tween create failed")
-        return false
-    end
-
-    local finished = false
-    local completedConn = tween.Completed:Connect(function(state)
-        if state == Enum.PlaybackState.Completed then finished = true end
-    end)
-
-    Motion.tween = tween
-    tween:Play()
+    -- The root stays unanchored. A short-lived token makes cancellation
+    -- cooperative, and Heartbeat interpolation avoids allocating Tween objects.
+    root.Anchored = false
+    local motionToken = { cancelled = false }
+    Motion.tween = motionToken
 
     local startedAt = tick()
-    local deadline = startedAt + duration + 4
+    local duration = math.max(initialDistance / speed, 0.025)
+    local deadline = startedAt + duration + 1.5
     local lastPos = startPos
     local lastProgressAt = startedAt
-    local unanchorAt = math.clamp(tonumber(Config.MoveUnanchorAt) or 0.8, 0.1, 1)
     local earlyTouchDistance = math.max(tonumber(Config.EarlyTouchDistance) or 10, 1)
-    local unanchoredEarly = false
     local lastTouchAt = 0
+    local reached = false
     local voidHit = false
 
     local loopOk, loopErr = pcall(function()
-        while not finished do
+        while not motionToken.cancelled do
             if not root.Parent then break end
             if not instanceAlive() or LocalPlayer.Character ~= charAtStart then break end
             if not Candy.Enabled or not Round.active or not isAlive() then break end
-            if Motion.tween ~= tween then break end
+            if Motion.tween ~= motionToken then break end
             if stopFn and stopFn() then break end
             if tick() > deadline then break end
 
+            local dt = RunService.Heartbeat:Wait()
+            dt = math.max(tonumber(dt) or (1 / 60), 1 / 240)
+            if not root.Parent or motionToken.cancelled then break end
             if Config.Noclip then Noclip.apply() end
 
             local now = tick()
-            local pos = root.Position
+            local targetPos = goalPos
+            if touchPart and touchPart.Parent then
+                targetPos = touchPart.Position
+            end
+
             local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
-            if pos.Y <= destroyY + 60 then
+            if root.Position.Y <= destroyY + 60 then
                 voidHit = true
                 break
             end
 
-            local remaining = (goalPos - pos).Magnitude
-            local progress = 1 - remaining / math.max(initialDistance, 0.001)
+            local distance = (targetPos - startPos).Magnitude
+            local currentDuration = math.max(distance / speed, 0.025)
+            local alpha = math.clamp((now - startedAt) / currentDuration, 0, 1)
+            -- Ease-out cubic stays quick over most of the travel and settles
+            -- smoothly instead of snapping to a stop at the candy.
+            local eased = 1 - ((1 - alpha) * (1 - alpha) * (1 - alpha))
+            local newPos = startPos:Lerp(targetPos, eased)
+            root.CFrame = CFrame.new(newPos) * rotation
 
-            if not unanchoredEarly and progress >= unanchorAt then
-                unanchoredEarly = true
-                if root.Anchored then root.Anchored = false end
-            end
-
-            if unanchoredEarly then
-                if root.Anchored then root.Anchored = false end
-            elseif not root.Anchored then
-                root.Anchored = true
-            end
-
-            root.AssemblyLinearVelocity = Vector3.zero
+            local frameVelocity = (newPos - lastPos) / dt
+            root.AssemblyLinearVelocity = frameVelocity + Vector3.new(0, Workspace.Gravity * dt, 0)
             root.AssemblyAngularVelocity = Vector3.zero
 
-            -- Fire as soon as the candy is within reach, even while the root
-            -- is still anchored/approaching. This is what lets a candy five
-            -- studs overhead be collected without climbing onto it first.
-            if touchPart and touchPart.Parent
-                and now - lastTouchAt >= 0.05 then
-                local touchDist = (touchPart.Position - pos).Magnitude
-                if touchDist <= earlyTouchDistance then
+            if touchPart and touchPart.Parent and now - lastTouchAt >= 0.045 then
+                if (touchPart.Position - newPos).Magnitude <= earlyTouchDistance then
                     lastTouchAt = now
                     fireTouch(root, touchPart)
                 end
             end
 
-            if (pos - lastPos).Magnitude > 0.005 then
-                lastPos = pos
-                lastProgressAt = now
-            elseif now - lastProgressAt > 1.5 then
-                dbg("move stalled", initialDistance, "studs")
+            local remaining = (targetPos - newPos).Magnitude
+            if alpha >= 1 or remaining <= 0.6 then
+                reached = true
                 break
             end
 
-            RunService.Heartbeat:Wait()
+            if (newPos - lastPos).Magnitude > 0.003 then
+                lastPos = newPos
+                lastProgressAt = now
+            elseif now - lastProgressAt > 1.0 then
+                dbg("move stalled", initialDistance, "studs")
+                break
+            end
         end
     end)
     if not loopOk then dbg("move error:", tostring(loopErr)) end
 
-    if not finished then pcall(function() tween:Cancel() end) end
-    completedConn:Disconnect()
-    if Motion.tween == tween then Motion.tween = nil end
-
-    Workspace.Gravity = originalGravity
-
+    if Motion.tween == motionToken then Motion.tween = nil end
     if root and root.Parent then
-        if finished then root.CFrame = goalCF end
+        if reached then
+            local finalPos = (touchPart and touchPart.Parent) and touchPart.Position or goalPos
+            root.CFrame = CFrame.new(finalPos) * rotation
+        end
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
         root.Anchored = false
     end
-    if hum and hum.Parent and autoRotate ~= nil then hum.AutoRotate = autoRotate end
+    if hum and hum.Parent and autoRotate ~= nil then
+        hum.AutoRotate = autoRotate
+    end
 
     if voidHit then
         Hide.recover("move fell into the void")
         return false
     end
-    return finished
+    return reached and not motionToken.cancelled
 end
 
 -- One-shot snap used for the first candy of a round. Teleporting from the
@@ -1812,37 +2184,17 @@ function Move.collect(target, id)
     if reached and Candy.Enabled and Round.active and isAlive() and Scan.available(obj) then
         local r = getRoot()
         if r and obj and obj.Parent then
-            local previousGravity = Workspace.Gravity
-            local touchOk = false
-            local ok, err = pcall(function()
-                Workspace.Gravity = 0
-                r.AssemblyLinearVelocity = Vector3.zero
-                r.AssemblyAngularVelocity = Vector3.zero
-
-                local finishTime = math.clamp(tonumber(Config.PickupFinishTime) or 0.12, 0.02, 0.5)
-                local touchUntil = tick() + finishTime
-                repeat
-                    if not Candy.Enabled or not Round.active or not isAlive() then break end
-                    if not obj.Parent or not Scan.available(obj) then break end
-                    r.CFrame = CFrame.new(obj.Position) * r.CFrame.Rotation
-                    r.AssemblyLinearVelocity = Vector3.zero
-                    r.AssemblyAngularVelocity = Vector3.zero
-                    fireTouch(r, obj)
-                    RunService.Heartbeat:Wait()
-                until tick() >= touchUntil
-                touchOk = not Scan.available(obj)
-            end)
-
-            if r and r.Parent then
-                r.AssemblyLinearVelocity = Vector3.zero
-                r.AssemblyAngularVelocity = Vector3.zero
-            end
-            Workspace.Gravity = previousGravity
-            if not ok then dbg("pickup touch error:", tostring(err)) end
-            if not touchOk and Scan.available(obj) then
+            -- Touch once on arrival, then allow at most a very short server
+            -- acknowledgement window. Never pin or repeatedly snap the root
+            -- onto the candy; the next route leg starts immediately on success.
+            local confirmUntil = tick() + math.clamp(tonumber(Config.PickupConfirmTime) or 0.025, 0, 0.06)
+            repeat
+                if not Candy.Enabled or not Round.active or not isAlive() then break end
+                if not obj.Parent or not Scan.available(obj) then break end
                 fireTouch(r, obj)
-                task.wait(0.05)
-            end
+                if tick() >= confirmUntil then break end
+                RunService.Heartbeat:Wait()
+            until false
         end
     end
 
@@ -1851,6 +2203,12 @@ function Move.collect(target, id)
     Candy.Target = nil
 
     if got then
+        if Candy.Plan and type(Candy.Plan.route) == "table"
+            and Candy.Plan.route[1] == obj then
+            table.remove(Candy.Plan.route, 1)
+            Candy.Plan.first = Candy.Plan.route[1]
+            Candy.Plan.count = math.max(0, (tonumber(Candy.Plan.count) or 1) - 1)
+        end
         Candy.Picked = Candy.Picked + 1
         Stats.addCandy(1)
         Candy.SkipUntil[obj] = nil
@@ -2732,6 +3090,30 @@ end
 
 -- ==================== FARM LOOP ====================
 local Farm = {}
+local function nextPlannedTarget()
+    local plan = Candy.Plan
+    local root = getRoot()
+    if not plan or plan.serial ~= Round.serial or type(plan.route) ~= "table" or not root then
+        return nil
+    end
+
+    while plan.route[1] do
+        local obj = plan.route[1]
+        local blockedUntil = Candy.SkipUntil[obj]
+        if Scan.available(obj) and (not blockedUntil or blockedUntil <= tick()) and Scan.safe(obj) then
+            return {
+                obj = obj,
+                pos = obj.Position,
+                dist = (obj.Position - root.Position).Magnitude,
+            }
+        end
+        table.remove(plan.route, 1)
+    end
+
+    Candy.Plan = nil
+    return nil
+end
+
 function Farm.run(id)
     local idleSince = tick()
     while workerOK(id) and Round.active and isAlive() do
@@ -2765,7 +3147,11 @@ function Farm.run(id)
         end
 
         local list = Scan.list(false)
-        local target, waitHint = Scan.best(list)
+        local target = nextPlannedTarget()
+        local waitHint
+        if not target then
+            target, waitHint = Scan.best(list)
+        end
         if not target then
             if waitHint then
                 -- Every safe candy is cooling down after a failed pickup.
@@ -2800,8 +3186,9 @@ function Farm.run(id)
                         tick() + 0.4
                     )
                 end
+                Candy.Plan = nil
                 Candy.LastScan = 0
-                task.wait(0.04)
+                task.wait(0.02)
             end
         end
     end
@@ -2962,7 +3349,7 @@ function Rejoin.queue(intent)
     if type(intent) == "table" then
         local jobId = tostring(intent.jobId or game.JobId or "")
         intentCode = string.format(
-            "{ kick = %s, farming = %s, jobId = %q, at = %d }",
+            "{ kick = %s, farming = %s, jobId = %q, at = %d, resumeStats = true }",
             tostring(intent.kick == true),
             tostring(intent.farming == true),
             jobId,
@@ -3692,6 +4079,10 @@ end)
 -- Void watchdog is always on; it only acts while the farm is enabled.
 Hide.startWatch()
 
+-- Start the client-side display/performance features before auto-starting.
+Hud.start()
+Performance.start()
+
 -- ==================== LEASE HEARTBEAT ====================
 -- Keeps the duplicate-execution guard fresh while this copy is loaded. When
 -- this copy stops, the heartbeat stops, so a later execution can take over
@@ -3747,6 +4138,8 @@ P.teardown = function()
     end
 
     Hide.stopWatch()
+    Hud.stop()
+    Performance.stop()
     releaseCharacter()
     Noclip.disable()
     AnimLock.disable()
@@ -3773,6 +4166,7 @@ P.api = {
     findCandies     = Scan.list,
     selectNearest   = Scan.best,
     selectBestPath  = Scan.best,
+    buildPaths      = function(list) return Scan.best(list or Scan.list(true)) end,
     plan            = function() return Candy.Plan end,
     collectCandy    = function(target) return Move.collect(target) end,
     knifeSweep      = Knife.sweep,
