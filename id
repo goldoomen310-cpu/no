@@ -207,6 +207,29 @@ Candy.Failures      = Candy.Failures or {}
 Candy.Plan          = nil
 P.candy = Candy
 
+-- TweenSpeed is a literal movement rate in studs per second. Keep Config and
+-- the public Candy state in sync when either field is adjusted at runtime.
+local lastSyncedTweenSpeed = tonumber(Config.TweenSpeed) or 25
+local function getTweenSpeed()
+    local configSpeed = tonumber(Config.TweenSpeed)
+    local candySpeed = tonumber(Candy.TweenSpeed)
+    if configSpeed and configSpeed ~= lastSyncedTweenSpeed
+        and (not candySpeed or candySpeed == lastSyncedTweenSpeed) then
+        lastSyncedTweenSpeed = configSpeed
+    elseif candySpeed and candySpeed ~= lastSyncedTweenSpeed
+        and (not configSpeed or configSpeed == lastSyncedTweenSpeed) then
+        lastSyncedTweenSpeed = candySpeed
+    elseif configSpeed then
+        lastSyncedTweenSpeed = configSpeed
+    elseif candySpeed then
+        lastSyncedTweenSpeed = candySpeed
+    end
+    lastSyncedTweenSpeed = math.clamp(lastSyncedTweenSpeed, 1, 200)
+    Config.TweenSpeed = lastSyncedTweenSpeed
+    Candy.TweenSpeed = lastSyncedTweenSpeed
+    return lastSyncedTweenSpeed
+end
+
 -- Claim the new instance before tearing the old one down so any coroutine
 -- left behind stops at its next check instead of moving the same root.
 P.instance = (tonumber(P.instance) or 0) + 1
@@ -1882,7 +1905,7 @@ do
         local routeLimit = math.min(remaining, #pool)
         local candidateLimit = math.clamp(math.floor(tonumber(Config.PathCandidates) or 5), 1, 5)
         local candidateCount = math.min(candidateLimit, #pool)
-        local speed = math.max(tonumber(Candy.TweenSpeed) or Config.TweenSpeed, 1)
+        local speed = getTweenSpeed()
         local pickupOverhead = math.max(tonumber(Config.PathPickupOverhead) or 0.035, 0)
         local candidates = {}
         local bestPlan, bestScore
@@ -2005,11 +2028,12 @@ function Move.to(goalPos, speed, stopFn, touchPart)
     if not root then return false end
     local charAtStart = LocalPlayer.Character
 
-    speed = math.max(tonumber(speed) or Config.TweenSpeed or 1, 1)
-    local startCF = root.CFrame
-    local startPos = startCF.Position
-    local rotation = startCF.Rotation
-    local initialDistance = (goalPos - startPos).Magnitude
+    -- Constant-speed velocity control: 25 means about 25 studs/second.
+    -- There is no easing curve, no duration-based acceleration, and no tween
+    -- overshoot. The target is refreshed every frame so route turns are direct.
+    speed = math.clamp(tonumber(speed) or getTweenSpeed(), 1, 200)
+    local firstTarget = (touchPart and touchPart.Parent) and touchPart.Position or goalPos
+    local initialDistance = (firstTarget - root.Position).Magnitude
     if initialDistance < 0.05 then return true end
 
     Motion.cancelTween()
@@ -2017,24 +2041,47 @@ function Move.to(goalPos, speed, stopFn, touchPart)
     local autoRotate = hum and hum.AutoRotate
     if hum then hum.AutoRotate = false end
 
-    -- The root stays unanchored. A short-lived token makes cancellation
-    -- cooperative, and Heartbeat interpolation avoids allocating Tween objects.
     root.Anchored = false
     local motionToken = { cancelled = false }
     Motion.tween = motionToken
 
     local startedAt = tick()
-    local duration = math.max(initialDistance / speed, 0.025)
-    local deadline = startedAt + duration + 1.5
-    local lastPos = startPos
+    local deadline = startedAt + (initialDistance / speed) + 2.5
+    local lastPos = root.Position
     local lastProgressAt = startedAt
     local earlyTouchDistance = math.max(tonumber(Config.EarlyTouchDistance) or 10, 1)
     local lastTouchAt = 0
     local reached = false
     local voidHit = false
 
+    local function steer(dt)
+        local targetPos = goalPos
+        if touchPart and touchPart.Parent then
+            targetPos = touchPart.Position
+        end
+
+        local currentPos = root.Position
+        local offset = targetPos - currentPos
+        local distance = offset.Magnitude
+        if distance <= 0.45 then
+            return true, currentPos
+        end
+
+        local travelSpeed = math.min(speed, distance / math.max(dt, 1 / 240))
+        local direction = offset.Unit
+        -- Compensate for half-frame gravitational displacement. This keeps
+        -- unanchored travel on the target vector without changing world gravity.
+        local gravityCompensation = Vector3.new(0, Workspace.Gravity * dt * 0.5, 0)
+        root.AssemblyLinearVelocity = direction * travelSpeed + gravityCompensation
+        root.AssemblyAngularVelocity = Vector3.zero
+        return false, currentPos
+    end
+
     local loopOk, loopErr = pcall(function()
-        while not motionToken.cancelled do
+        -- Set the first velocity immediately instead of waiting a full frame;
+        -- after a pickup the next Move.to call can turn straight into its target.
+        reached = steer(1 / 60)
+        while not reached and not motionToken.cancelled do
             if not root.Parent then break end
             if not instanceAlive() or LocalPlayer.Character ~= charAtStart then break end
             if not Candy.Enabled or not Round.active or not isAlive() then break end
@@ -2042,51 +2089,29 @@ function Move.to(goalPos, speed, stopFn, touchPart)
             if stopFn and stopFn() then break end
             if tick() > deadline then break end
 
-            local dt = RunService.Heartbeat:Wait()
-            dt = math.max(tonumber(dt) or (1 / 60), 1 / 240)
+            local frameDt = RunService.Heartbeat:Wait()
+            local dt = math.max(tonumber(frameDt) or (1 / 60), 1 / 240)
             if not root.Parent or motionToken.cancelled then break end
             if Config.Noclip then Noclip.apply() end
 
             local now = tick()
-            local targetPos = goalPos
-            if touchPart and touchPart.Parent then
-                targetPos = touchPart.Position
-            end
-
+            local currentPos = root.Position
             local destroyY = tonumber(Workspace.FallenPartsDestroyHeight) or -500
-            if root.Position.Y <= destroyY + 60 then
+            if currentPos.Y <= destroyY + 60 then
                 voidHit = true
                 break
             end
 
-            local distance = (targetPos - startPos).Magnitude
-            local currentDuration = math.max(distance / speed, 0.025)
-            local alpha = math.clamp((now - startedAt) / currentDuration, 0, 1)
-            -- Ease-out cubic stays quick over most of the travel and settles
-            -- smoothly instead of snapping to a stop at the candy.
-            local eased = 1 - ((1 - alpha) * (1 - alpha) * (1 - alpha))
-            local newPos = startPos:Lerp(targetPos, eased)
-            root.CFrame = CFrame.new(newPos) * rotation
-
-            local frameVelocity = (newPos - lastPos) / dt
-            root.AssemblyLinearVelocity = frameVelocity + Vector3.new(0, Workspace.Gravity * dt, 0)
-            root.AssemblyAngularVelocity = Vector3.zero
-
+            reached = steer(dt)
             if touchPart and touchPart.Parent and now - lastTouchAt >= 0.045 then
-                if (touchPart.Position - newPos).Magnitude <= earlyTouchDistance then
+                if (touchPart.Position - currentPos).Magnitude <= earlyTouchDistance then
                     lastTouchAt = now
                     fireTouch(root, touchPart)
                 end
             end
 
-            local remaining = (targetPos - newPos).Magnitude
-            if alpha >= 1 or remaining <= 0.6 then
-                reached = true
-                break
-            end
-
-            if (newPos - lastPos).Magnitude > 0.003 then
-                lastPos = newPos
+            if (currentPos - lastPos).Magnitude > 0.003 then
+                lastPos = currentPos
                 lastProgressAt = now
             elseif now - lastProgressAt > 1.0 then
                 dbg("move stalled", initialDistance, "studs")
@@ -2098,11 +2123,14 @@ function Move.to(goalPos, speed, stopFn, touchPart)
 
     if Motion.tween == motionToken then Motion.tween = nil end
     if root and root.Parent then
-        if reached then
-            local finalPos = (touchPart and touchPart.Parent) and touchPart.Position or goalPos
-            root.CFrame = CFrame.new(finalPos) * rotation
+        local collectedDuringTravel = touchPart
+            and (not touchPart.Parent or not Scan.available(touchPart))
+        -- Keep travel velocity only when touch confirmed collection during the
+        -- approach. The next planned Move.to replaces it immediately. If the
+        -- move stopped for any other reason, release the root cleanly.
+        if not collectedDuringTravel then
+            root.AssemblyLinearVelocity = Vector3.zero
         end
-        root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
         root.Anchored = false
     end
@@ -2179,7 +2207,7 @@ function Move.collect(target, id)
         return false
     end
 
-    local reached = Move.to(obj.Position, Candy.TweenSpeed, stopFn, obj)
+    local reached = Move.to(obj.Position, getTweenSpeed(), stopFn, obj)
 
     if reached and Candy.Enabled and Round.active and isAlive() and Scan.available(obj) then
         local r = getRoot()
