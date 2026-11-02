@@ -16,9 +16,9 @@
 --    * Duplicate execution: the live copy holds a heartbeat lease in getgenv.
 --      A second execution now prints a notice and exits without touching the
 --      first (set getgenv().__mm2candy_force = true first to replace it).
---    * Opening snap: as soon as the round's first candy is visible, the root
---      teleports straight to it once, then resumes the normal tween farming.
---      A per-round serial guard makes the snap strictly one-shot.
+--    * Opening snap: while a round has no available candy, the character stays
+--      hidden under the map. When the first candy appears, the root snaps to it
+--      once per round, then all later pickups use normal farm movement.
 --    * Register pressure: state lives in tables and self-contained systems are
 --      scoped in do-blocks, keeping the main chunk well under the 200-local
 --      "out of local registers" limit.
@@ -120,7 +120,7 @@ local Config = {
     CandyCap             = 50,
     CandyCacheTTL        = 0.5, -- used by non-forced checks; target selection always forces a fresh scan
     CandyMaxDistance     = 20000,
-    TweenSpeed           = 23,
+    TweenSpeed           = 25,
     PathCandidates       = 12,
     PathPickupOverhead   = 0.035,
     PickupConfirmTime    = 0.025,
@@ -165,7 +165,7 @@ local Config = {
     -- Auto-buy / open the Halloween Box '26. The event shop treats the two
     -- price entries as separate purchase options, so 600 Candies2026 opens
     -- one box (the HalloweenKey2026 option is a different button).
-    AutoBuyBox           = false,
+    AutoBuyBox           = true,
     AutoBuyBoxInterval   = 5,
     AutoBuyBoxId         = "Halloween2026Box",
     AutoBuyBoxName       = "Halloween Box '26",
@@ -174,7 +174,7 @@ local Config = {
     -- Discord report, sent once per successful crate open.
     -- Set your own freshly rotated webhook here. The URL in the uploaded
     -- file was a live webhook credential, so it is intentionally not copied.
-    WebhookUrl           = "https://discord.com/api/webhooks/1390733232491986944/9fWTrWzVtBk1SEh_8iwWT0i6IyneGz9PmXUwuU19aphbkBTi2_7QtJannAQVz6lf8CGa",
+    WebhookUrl           = "",
     WebhookName          = "AutoCandyFarm",
     -- Client-side map optimization. Map parts are kept queryable for floor
     -- detection and candy scanning, but are made non-collidable. Visual stripping
@@ -3176,7 +3176,6 @@ local function nextPlannedTarget()
 end
 
 function Farm.run(id)
-    local idleSince = tick()
     while workerOK(id) and Round.active and isAlive() do
         -- A fling, shot, gun teleport or revenge owns the root right now.
         -- Waiting avoids a false "unreachable" penalty on the chosen candy.
@@ -3196,7 +3195,10 @@ function Farm.run(id)
         if not Killer.exists() then
             local list = Scan.list(false)
             if #list == 0 then
-                if not Candy.Hidden and tick() - idleSince > 0.4 then Hide.hide() end
+                -- Keep the character hidden throughout an active round while
+                -- the first candy has not spawned (or while the map is empty).
+                -- Hide.hide() is retried every pass if the floor was not ready.
+                if not Candy.Hidden then Hide.hide() end
                 task.wait(0.15)
                 continue
             end
@@ -3212,27 +3214,31 @@ function Farm.run(id)
         -- map instead of following stale entries from the previous route.
         local target, waitHint = nextPlannedTarget()
         if not target then
+            -- No currently usable target: stay under the map even if candies
+            -- have not spawned yet or are temporarily on failure cooldown.
+            -- This call is intentionally retried until hiding succeeds.
+            if not Candy.Hidden then Hide.hide() end
             if waitHint then
                 -- Every safe candy is cooling down after a failed pickup.
                 task.wait(math.min(waitHint, 0.25))
             else
-                if not Candy.Hidden and tick() - idleSince > 0.4 then Hide.hide() end
                 task.wait(0.1)
             end
         else
-            idleSince = tick()
-
-            -- The first candy of a round gets one instant snap; waiting for
-            -- the tween from spawn (or from under the map) costs the opening
-            -- seconds. Round.serial is the guard: at most one snap per round.
+            -- Exactly one successful opening snap is allowed per round. Once
+            -- it has been used, any later unhide returns to the saved surface
+            -- position and the normal collection movement handles the candy.
+            -- Never teleport to a later candy merely because we were hidden.
             if Candy.FirstTeleportSerial ~= Round.serial then
                 if Move.firstTeleport(target) then
                     Candy.FirstTeleportSerial = Round.serial
                 elseif Candy.Hidden then
-                    Hide.unhideForCandy(target)
+                    -- The snap did not happen, so recover to the safe surface;
+                    -- Move.collect will approach this target normally.
+                    Hide.unhide()
                 end
             elseif Candy.Hidden then
-                Hide.unhideForCandy(target)
+                Hide.unhide()
             end
 
             local got, reason = Move.collect(target, id)
