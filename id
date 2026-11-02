@@ -180,9 +180,9 @@ local Config = {
     -- detection and candy scanning, but are made non-collidable. Visual stripping
     -- remains separate from collision handling.
     DisableMapCollision  = true,
-    DestroyMapVisuals    = true,
-    RemovePlayerModels   = true,
-    Disable3DRendering   = true,
+    DestroyMapVisuals    = false,
+    RemovePlayerModels   = false,
+    Disable3DRendering   = false,
     ShowStatsHUD         = true,
 }
 
